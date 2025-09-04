@@ -1,5 +1,6 @@
 import numpy as np
 import nibabel as nib
+import skimage.measure
 from skimage.measure import label, regionprops
 from scipy.ndimage import binary_erosion, binary_dilation, distance_transform_edt
 
@@ -49,17 +50,17 @@ def erosion_derived_confluent_lesion_splitting(labeled_array):
     current_state = original_volume.copy()
     while True:
         eroded = binary_erosion(current_state)
-        labeled_eroded = label(eroded, connectivity=3)
+        labeled_eroded = skimage.measure.label(eroded, connectivity=3)
 
         # Check if further erosion would eliminate any region completely
-        if np.sum(eroded) == 0 or label(eroded, connectivity=3).max() != label(current_state, connectivity=3).max():
+        if np.sum(eroded) == 0 or skimage.measure.label(eroded, connectivity=3).max() != skimage.measure.label(current_state, connectivity=3).max():
             center_points = current_state
             break
 
         current_state = eroded
 
     # Label center points
-    center_labels = label(center_points, connectivity=3)
+    center_labels = skimage.measure.label(center_points, connectivity=3)
     center_labels = relabel_from_largest_to_smallest(center_labels)
 
     # Create distance maps for expansion

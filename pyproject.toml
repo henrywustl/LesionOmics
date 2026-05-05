@@ -26,3 +26,7 @@ dev = ["pytest>=7.0", "pytest-cov"]
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["src*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-v", "--tb=short"]

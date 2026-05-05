@@ -24,10 +24,11 @@ def erosion_derived_confluent_lesion_splitting(labeled_array: np.ndarray) -> np.
     Split confluent (touching) lesions using erosion-derived centre points
     and distance-transform Voronoi partitioning.
 
-    Each connected region is eroded until a further erosion step would change
-    the number of connected components, yielding stable centre cores.  The
-    original volume is then re-partitioned by assigning each voxel to the
-    nearest core via argmin over stacked EDT distance maps.
+    The binary union of all labeled regions is eroded iteratively.  When an
+    erosion step causes the number of connected components to INCREASE (i.e.
+    two lobes separate), the eroded state is used directly as centre seeds.
+    When a component vanishes the pre-erosion state is used.  Original voxels
+    are then re-assigned to the nearest seed via argmin over EDT distance maps.
     """
     props = regionprops(labeled_array)
     original_volume = np.zeros_like(labeled_array, dtype=bool)
@@ -42,7 +43,12 @@ def erosion_derived_confluent_lesion_splitting(labeled_array: np.ndarray) -> np.
         if eroded.sum() == 0:
             break
         n_eroded = skimage.measure.label(eroded, connectivity=3).max()
-        if n_eroded != n_current:
+        if n_eroded > n_current:
+            # Erosion revealed separate sub-regions — use them as centre seeds
+            current_state = eroded
+            break
+        if n_eroded < n_current:
+            # A component vanished — keep current_state
             break
         current_state = eroded
         n_current = n_eroded

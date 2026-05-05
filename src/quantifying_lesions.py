@@ -1,267 +1,385 @@
-import numpy as np
+"""
+Per-lesion feature extraction for 3D neuroimaging data.
+
+Computes shape, intensity, texture (via PyRadiomics), and probabilistic
+features for every labeled region in a NIfTI segmentation image.  Any
+number of imaging modalities can be supplied — the same feature set is
+computed for each channel automatically.
+"""
+
+import warnings
+from itertools import combinations
+
 import nibabel as nib
+import numpy as np
 import pandas as pd
-from skimage.measure import label, regionprops, shannon_entropy
-from scipy.spatial import ConvexHull
 from scipy import ndimage, stats
-from sklearn.decomposition import PCA
+from scipy.ndimage import sobel
 from scipy.spatial import ConvexHull
-import cv2
+from skimage.measure import euler_number, marching_cubes, mesh_surface_area, regionprops
+
+try:
+    import radiomics  # noqa: F401
+    _RADIOMICS_AVAILABLE = True
+except ImportError:
+    _RADIOMICS_AVAILABLE = False
+    warnings.warn(
+        "pyradiomics is not installed — texture features will be skipped. "
+        "Install with: pip install pyradiomics",
+        ImportWarning,
+        stacklevel=2,
+    )
 
 
-def voxel_volume_from_affine(header):
-    """
-    Returns the volume (in mm^3) of a single voxel,
-    computed from the 3x3 submatrix of the affine.
-    """
-    voxel_sizes = header.get_zooms()[:3]
-    voxel_volume = voxel_sizes[0] * voxel_sizes[1] * voxel_sizes[2]
-    return voxel_volume
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 
-def compute_3d_convex_hull_volume(coords_vox):
-    """
-    Given an (N x 3) array of real-space coordinates in mm,
-    compute the volume of the 3D convex hull around these points.
-    Returns 0.0 (or np.nan) if the region is degenerate (2D or 1D).
-    """
-    # If fewer than 4 points, the hull is degenerate
-    if coords_vox.shape[0] < 4:
+def voxel_volume_from_header(header) -> float:
+    """Voxel volume in mm³ from a NIfTI header."""
+    zooms = header.get_zooms()[:3]
+    return float(zooms[0] * zooms[1] * zooms[2])
+
+
+def _convex_hull_volume(coords: np.ndarray) -> float:
+    """Convex hull volume (voxel units) of an (N, 3) integer coordinate array."""
+    if coords.shape[0] < 4:
         return 0.0
-
-    # Check if points span at least some 3D extent
-    extents = coords_vox.max(axis=0) - coords_vox.min(axis=0)
-    if np.count_nonzero(extents) < 3:
-        # The shape is effectively 2D or 1D in 3D space
+    if np.count_nonzero(coords.max(axis=0) - coords.min(axis=0)) < 3:
         return 0.0
-
-    hull = ConvexHull(coords_vox)
-    return hull.volume
+    return float(ConvexHull(coords).volume)
 
 
-def compute_4d_inertia(coords_vox, intensities):
+def _surface_area_mm2(mask: np.ndarray, voxel_sizes: tuple) -> float:
+    """Surface area in mm² via marching cubes.  Returns NaN for degenerate regions."""
+    try:
+        verts, faces, _, _ = marching_cubes(
+            mask.astype(np.float32), level=0.5, spacing=voxel_sizes
+        )
+        return float(mesh_surface_area(verts, faces))
+    except Exception:
+        return np.nan
+
+
+def _compute_4d_inertia(coords: np.ndarray, intensities: np.ndarray):
     """
-    Given:
-      coords_mm: (N, 3) array of spatial coordinates in mm
-      intensities: (N,) array of T1 or T2 intensities (the 4th dimension)
-
-    Returns:
-      inertia_4d: (4x4) second-moment matrix about the centroid in 4D
-      eigvals_4d, eigvecs_4d: eigenvalues and eigenvectors of that matrix
-      centroid_4d: the mean of points in (x, y, z, intensity) space
+    Second-moment matrix in 4D: (x, y, z, intensity).
+    Returns (eigvals_4, centroid_4) or (None, None) for empty regions.
     """
-    if len(coords_vox) == 0:
-        return None, None, None, None
-
-    # Stack to create an (N, 4) array
-    points_4d = np.column_stack([coords_vox, intensities])
-
-    # Compute centroid in 4D
-    centroid_4d = points_4d.mean(axis=0)  # shape: (4,)
-
-    # Center the points on the 4D centroid
-    centered_4d = points_4d - centroid_4d
-
-    # Inertia (second moment) = sum of outer products
-    # Typically for an "inertia" about the centroid, we sum (or average) (p - mean) (p - mean)^T
-    # If you want a pure 'sum', use dot directly:
-    inertia_4d = centered_4d.T @ centered_4d  # shape: (4,4)
-
-    # For the eigen-decomposition
-    eigvals_4d, eigvecs_4d = np.linalg.eigh(inertia_4d)
-
-    return inertia_4d, eigvals_4d, eigvecs_4d, centroid_4d
+    if coords.shape[0] == 0:
+        return None, None
+    points = np.column_stack([coords, intensities])
+    centroid = points.mean(axis=0)
+    centered = points - centroid
+    eigvals = np.linalg.eigvalsh(centered.T @ centered)
+    return eigvals, centroid
 
 
-# -------------------------------------------------------------------------
-# 1. Load images
-# -------------------------------------------------------------------------
-labeled_img = nib.load("/ceph/chpc/mapped/brier/SLOWLY_EVOLVING_LESIONS/output_labeled.nii.gz")
-labeled_data = labeled_img.get_fdata()  # shape: X x Y x Z
-affine = labeled_img.affine
-header = labeled_img.header
+def _intensity_stats(vals: np.ndarray, prefix: str) -> dict:
+    """Full intensity statistics for a flat array of voxel values."""
+    _keys = (
+        "mean", "median", "mode", "min", "max", "var", "std",
+        "skewness", "kurtosis", "moment5", "entropy",
+        "iqr", "p10", "p25", "p75", "p90", "cov", "energy", "rms",
+    )
+    if vals.size == 0:
+        return {f"{prefix}_{k}": np.nan for k in _keys}
 
-t1_img = nib.load("/ceph/chpc/mapped/brier/SLOWLY_EVOLVING_LESIONS/T1.nii.gz")
-t1_data = t1_img.get_fdata()
+    mean = float(np.mean(vals))
+    std = float(np.std(vals))
+    p10, p25, p75, p90 = np.percentile(vals, [10, 25, 75, 90])
+    hist_counts, _ = np.histogram(vals, bins=min(64, vals.size))
 
-t2_img = nib.load("/ceph/chpc/mapped/brier/SLOWLY_EVOLVING_LESIONS/T2.nii.gz")
-t2_data = t2_img.get_fdata()
-
-voxel_vol = voxel_volume_from_affine(header)
-
-# List of all labels (excluding 0 = background)
-all_labels = np.unique(labeled_data)
-all_labels = all_labels[all_labels != 0]
-
-# Prepare storage for results
-results = []
-
-# -------------------------------------------------------------------------
-# 2. For each label (blob), compute shape measurements + T1/T2 metrics
-# -------------------------------------------------------------------------
-for label_val in all_labels:
-    mask = (labeled_data == label_val)
-
-    # ----------------------------------------------------------
-    # Basic shape/volume
-    # ----------------------------------------------------------
-    region_volume_vox = np.count_nonzero(mask)  # * voxel_vol
-
-    # ----------------------------------------------------------
-    # Center of mass (in voxel and mm space)
-    # ----------------------------------------------------------
-    # Using ndimage's center_of_mass
-    com_vox = ndimage.center_of_mass(mask)
-
-    # ----------------------------------------------------------
-    # Principal axes (inertia tensor) in 3D
-    # ----------------------------------------------------------
-    # regionprops can compute 3D inertia tensors, eigenvalues, centroids, etc.
-    # But regionprops works on labeled images. We'll isolate just this region as label=1:
-    temp_label = np.zeros_like(mask, dtype=np.int32)
-    temp_label[mask] = 1
-
-    # First compute spatial moments
-    moments = cv2.moments(temp_label)
-
-    # Then compute Hu Moments
-    hu_moments = cv2.HuMoments(moments).flatten()  # Flatten to 1D array
-
-    props = regionprops(temp_label)
-    # regionprops returns a list (one entry for each label). Here we have exactly one label=1.
-    rprop = props[0]
-
-    # 3D inertia
-    # rprop.inertia_tensor is a 3x3 matrix
-    inertia_tensor = rprop.inertia_tensor
-    inertia_eigs = rprop.inertia_tensor_eigvals  # 3 eigenvalues
-    # You could sort them descending or ascending as needed
-
-    # For the 3D centroid, regionprops also gives:
-    # rprop.centroid, which should match com_vox in many cases.
-
-    # ----------------------------------------------------------
-    # Compactness / "convexness" in 3D
-    # ----------------------------------------------------------
-    # As regionprops3D does not yet provide a built-in "convex_volume" for 3D,
-    # we can do it manually via the convex hull of the voxel coordinates in mm space.
-
-    # Get all voxel coordinates for this blob
-    coords_vox = np.column_stack(np.where(mask))
-
-    # Compute 3D convex hull
-    convex_vol = compute_3d_convex_hull_volume(coords_vox)
-    # "Solidity" or "convexness" = volume of region / volume of hull
-    # If convex_vol is zero (e.g., degenerate region), set ratio to 1.0 or np.nan
-    if convex_vol > 0.0:
-        convexness = region_volume_vox / convex_vol
-    else:
-        convexness = np.nan
-
-    # ----------------------------------------------------------
-    # T1/T2 intensity metrics within the blob
-    # ----------------------------------------------------------
-    t1_vals = t1_data[mask]
-    t2_vals = t2_data[mask]
-
-    t1_mean = np.mean(t1_vals) if t1_vals.size > 0 else np.nan
-    t1_median = np.median(t1_vals) if t1_vals.size > 0 else np.nan
-    t1_mode = stats.mode(t1_vals, keepdims=False)[0] if t1_vals.size > 0 else np.nan
-    t1_min, t1_max = (np.min(t1_vals), np.max(t1_vals)) if t1_vals.size > 0 else (np.nan, np.nan)
-    np.var(t1_vals)
-    np.std(t1_vals)
-    scipy.stats.skew(t1_vals)
-    scipy.stats.kurtosis(t1_vals)
-    n = 5  # 5th moment
-    moment5 = np.mean((t1_vals - np.mean(t1_vals)) ** n)
-    entropy = shannon_entropy(t1_vals)
-    # First compute spatial moments
-    moments = cv2.moments(temp_label)
-    # Then compute Hu Moments
-    hu_moments = cv2.HuMoments(moments).flatten()  # Flatten to 1D array
-
-    t2_mean = np.mean(t2_vals) if t2_vals.size > 0 else np.nan
-    t2_median = np.median(t2_vals) if t2_vals.size > 0 else np.nan
-    t2_mode = stats.mode(t2_vals, keepdims=False)[0] if t2_vals.size > 0 else np.nan
-    t2_min, t2_max = (np.min(t2_vals), np.max(t2_vals)) if t2_vals.size > 0 else (np.nan, np.nan)
-
-    # ------------------------------------------------------
-    # 3D inertia with regionprops
-    # ------------------------------------------------------
-    # regionprops expects a labeled image. We'll isolate just this region as label=1.
-    temp_label = np.zeros_like(mask, dtype=np.int32)
-    temp_label[mask] = 1
-
-    rprops = regionprops(temp_label)
-    # There should be exactly one region
-    rp = rprops[0]
-
-    inertia_tensor_3d = rp.inertia_tensor  # 3x3
-    inertia_eigs_3d = rp.inertia_tensor_eigvals  # length 3
-    centroid_vox_3d = rp.centroid  # (z, y, x) in voxel coords
-    # regionprops centroid is (row, col, slice) => (y, x, z) in 2D, or (z, y, x) in 3D
-    # For nib, we might want to reorder or carefully interpret if needed
-    # Note: The above reversing depends on your dimension ordering. 
-    # Check carefully. Or just compare with e.g. ndimage.center_of_mass.
-
-    # ------------------------------------------------------
-    # "4D" inertia with T1 intensities
-    # ------------------------------------------------------
-    t1_vals = t1_data[mask]
-    inertia_4d_T1, eigvals_4d_T1, eigvecs_4d_T1, centroid_4d_T1 = \
-        compute_4d_inertia(coords_vox, t1_vals)
-
-    # ------------------------------------------------------
-    # "4D" inertia with T2 intensities
-    # ------------------------------------------------------
-    t2_vals = t2_data[mask]
-    inertia_4d_T2, eigvals_4d_T2, eigvecs_4d_T2, centroid_4d_T2 = \
-        compute_4d_inertia(coords_vox, t2_vals)
-
-    # ----------------------------------------------------------
-    # Assemble results for this label
-    # ----------------------------------------------------------
-    result_dict = {
-        "label": label_val,
-        "volume_vox": region_volume_vox,
-        "center_of_mass_vox": com_vox,
-        "convex_hull_volume_vox": convex_vol,
-        "convexness": convexness,
-
-        # 3D inertia:
-        "inertia_tensor_3d": inertia_tensor_3d,  # 3x3
-        "inertia_eigs_3d": inertia_eigs_3d,  # length 3
-        "centroid_vox_3d": centroid_vox_3d,
-
-        # 4D inertia with T1:
-        "inertia_4d_T1": inertia_4d_T1 if inertia_4d_T1 is not None else np.nan,
-        "eigvals_4d_T1": eigvals_4d_T1 if eigvals_4d_T1 is not None else np.nan,
-        "centroid_4d_T1": centroid_4d_T1 if centroid_4d_T1 is not None else np.nan,
-
-        # 4D inertia with T2:
-        "inertia_4d_T2": inertia_4d_T2 if inertia_4d_T2 is not None else np.nan,
-        "eigvals_4d_T2": eigvals_4d_T2 if eigvals_4d_T2 is not None else np.nan,
-        "centroid_4d_T2": centroid_4d_T2 if centroid_4d_T2 is not None else np.nan,
-
-        "t1_mean": t1_mean,
-        "t1_median": t1_median,
-        "t1_mode": t1_mode,
-        "t1_min": t1_min,
-        "t1_max": t1_max,
-
-        "t2_mean": t2_mean,
-        "t2_median": t2_median,
-        "t2_mode": t2_mode,
-        "t2_min": t2_min,
-        "t2_max": t2_max,
+    return {
+        f"{prefix}_mean":     mean,
+        f"{prefix}_median":   float(np.median(vals)),
+        f"{prefix}_mode":     float(stats.mode(vals, keepdims=False)[0]),
+        f"{prefix}_min":      float(np.min(vals)),
+        f"{prefix}_max":      float(np.max(vals)),
+        f"{prefix}_var":      float(np.var(vals)),
+        f"{prefix}_std":      std,
+        f"{prefix}_skewness": float(stats.skew(vals)),
+        f"{prefix}_kurtosis": float(stats.kurtosis(vals)),
+        f"{prefix}_moment5":  float(np.mean((vals - mean) ** 5)),
+        f"{prefix}_entropy":  float(stats.entropy(hist_counts + 1e-9)),
+        f"{prefix}_iqr":      float(p75 - p25),
+        f"{prefix}_p10":      float(p10),
+        f"{prefix}_p25":      float(p25),
+        f"{prefix}_p75":      float(p75),
+        f"{prefix}_p90":      float(p90),
+        f"{prefix}_cov":      (std / mean) if mean != 0 else np.nan,
+        f"{prefix}_energy":   float(np.sum(vals ** 2)),
+        f"{prefix}_rms":      float(np.sqrt(np.mean(vals ** 2))),
     }
 
-    results.append(result_dict)
 
-# -------------------------------------------------------------------------
-# 3. Create a DataFrame of all results and save
-# -------------------------------------------------------------------------
-df = pd.DataFrame(results)
-print(df)
+def _boundary_gradient_stats(data: np.ndarray, mask: np.ndarray, prefix: str) -> dict:
+    """
+    Mean and std of gradient magnitude at the 1-voxel erosion boundary.
+    Captures rim-enhancing vs. diffuse signal patterns.
+    """
+    gx = sobel(data, axis=0)
+    gy = sobel(data, axis=1)
+    gz = sobel(data, axis=2)
+    grad_mag = np.sqrt(gx ** 2 + gy ** 2 + gz ** 2)
 
-df.to_csv("lesion_measurements.csv", index=False)
+    surface = mask & ~ndimage.binary_erosion(mask)
+    surf_vals = grad_mag[surface]
+    if surf_vals.size == 0:
+        return {
+            f"{prefix}_boundary_grad_mean": np.nan,
+            f"{prefix}_boundary_grad_std":  np.nan,
+        }
+    return {
+        f"{prefix}_boundary_grad_mean": float(np.mean(surf_vals)),
+        f"{prefix}_boundary_grad_std":  float(np.std(surf_vals)),
+    }
+
+
+def _build_radiomics_extractor():
+    """Instantiate a PyRadiomics extractor with texture feature classes enabled."""
+    import logging
+    logging.getLogger("radiomics").setLevel(logging.ERROR)
+    from radiomics import featureextractor
+
+    settings = {"binWidth": 25, "enableCExtensions": True, "geometryTolerance": 1e-6}
+    ex = featureextractor.RadiomicsFeatureExtractor(**settings)
+    ex.disableAllFeatures()
+    for cls in ("glcm", "glrlm", "glszm", "ngtdm"):
+        ex.enableFeatureClassByName(cls)
+    return ex
+
+
+def _radiomics_features(
+    mask: np.ndarray,
+    data: np.ndarray,
+    header,
+    prefix: str,
+    extractor,
+) -> dict:
+    """Run PyRadiomics on a single lesion mask crop and return a flat feature dict."""
+    if extractor is None:
+        return {}
+    try:
+        import SimpleITK as sitk
+
+        coords = np.argwhere(mask)
+        lo = np.maximum(coords.min(axis=0) - 2, 0)
+        hi = np.minimum(coords.max(axis=0) + 3, np.array(mask.shape))
+        slc = tuple(slice(lo[i], hi[i]) for i in range(3))
+
+        img_crop = data[slc].astype(np.float32)
+        msk_crop = mask[slc].astype(np.uint8)
+        spacing = [float(z) for z in header.get_zooms()[:3]]
+
+        img_sitk = sitk.GetImageFromArray(img_crop)
+        img_sitk.SetSpacing(spacing)
+        msk_sitk = sitk.GetImageFromArray(msk_crop)
+        msk_sitk.SetSpacing(spacing)
+
+        result = extractor.execute(img_sitk, msk_sitk, label=1)
+        return {
+            f"{prefix}_radiomics_{k.split('_', 1)[-1]}": float(v)
+            for k, v in result.items()
+            if not k.startswith("diagnostics")
+            and isinstance(v, (int, float, np.floating))
+        }
+    except Exception as exc:
+        warnings.warn(
+            f"PyRadiomics skipped for '{prefix}' ({mask.sum()} vox): {exc}"
+        )
+        return {}
+
+
+# ── Public API ─────────────────────────────────────────────────────────────────
+
+
+def quantify_lesions(
+    labeled_img: nib.Nifti1Image,
+    modalities: dict,
+    prob_map: nib.Nifti1Image = None,
+    nawm_mask: nib.Nifti1Image = None,
+    include_radiomics: bool = True,
+) -> pd.DataFrame:
+    """
+    Compute per-lesion features from a labeled NIfTI segmentation.
+
+    Args:
+        labeled_img:       NIfTI with integer lesion labels (0 = background).
+        modalities:        Dict mapping modality name to NIfTI image, e.g.
+                           {"T1": t1_img, "T2": t2_img, "FLAIR": flair_img}.
+                           Any 3D imaging modality is accepted.
+        prob_map:          Optional probabilistic segmentation NIfTI (0-1 floats).
+                           Enables fuzzy/confidence feature columns.
+        nawm_mask:         Optional binary NAWM mask NIfTI.  Enables NAWM-
+                           normalised intensity columns per modality.
+        include_radiomics: Whether to extract PyRadiomics texture features.
+                           Requires pyradiomics to be installed.
+
+    Returns:
+        pd.DataFrame with one row per lesion.
+    """
+    labeled_data = labeled_img.get_fdata()
+    affine = labeled_img.affine
+    header = labeled_img.header
+    voxel_vol = voxel_volume_from_header(header)
+    voxel_sizes = tuple(float(z) for z in header.get_zooms()[:3])
+
+    mod_arrays = {name: img.get_fdata() for name, img in modalities.items()}
+    mod_names = list(mod_arrays.keys())
+
+    # NAWM reference statistics per modality
+    nawm_stats: dict = {}
+    if nawm_mask is not None:
+        nawm_bin = nawm_mask.get_fdata().astype(bool)
+        for name, arr in mod_arrays.items():
+            w = arr[nawm_bin]
+            nawm_stats[name] = (float(np.mean(w)), float(np.std(w)))
+
+    prob_data = prob_map.get_fdata() if prob_map is not None else None
+
+    all_labels = np.unique(labeled_data)
+    all_labels = all_labels[all_labels != 0]
+
+    # Precompute centroids once for inter-lesion distance
+    centroids: dict = {
+        lv: ndimage.center_of_mass(labeled_data == lv) for lv in all_labels
+    }
+
+    extractor = None
+    if include_radiomics and _RADIOMICS_AVAILABLE:
+        extractor = _build_radiomics_extractor()
+
+    results = []
+    for label_val in all_labels:
+        mask = labeled_data == label_val
+        coords = np.argwhere(mask)  # (N, 3) voxel indices
+        row: dict = {"label": int(label_val)}
+
+        # ── Volume ──────────────────────────────────────────────────────────
+        n_vox = int(coords.shape[0])
+        vol_mm3 = n_vox * voxel_vol
+        row["volume_vox"] = n_vox
+        row["volume_mm3"] = vol_mm3
+
+        # ── Centre of mass ──────────────────────────────────────────────────
+        com_vox = centroids[label_val]
+        com_mm = nib.affines.apply_affine(affine, np.array(com_vox))
+        row.update({
+            "com_x_vox": com_vox[0], "com_y_vox": com_vox[1], "com_z_vox": com_vox[2],
+            "com_x_mm":  float(com_mm[0]),
+            "com_y_mm":  float(com_mm[1]),
+            "com_z_mm":  float(com_mm[2]),
+            "hemisphere": "R" if com_mm[0] >= 0 else "L",
+        })
+
+        # ── Bounding box ────────────────────────────────────────────────────
+        rp = regionprops(mask.astype(np.int32))[0]
+        bb = rp.bbox  # (min0, min1, min2, max0, max1, max2)
+        bb_dims = (bb[3] - bb[0], bb[4] - bb[1], bb[5] - bb[2])
+        bb_vol = int(bb_dims[0] * bb_dims[1] * bb_dims[2])
+        row.update({
+            "bbox_dim0_vox":   bb_dims[0],
+            "bbox_dim1_vox":   bb_dims[1],
+            "bbox_dim2_vox":   bb_dims[2],
+            "bbox_volume_vox": bb_vol,
+            "bbox_fill_ratio": n_vox / bb_vol if bb_vol > 0 else np.nan,
+        })
+
+        # ── Convex hull ─────────────────────────────────────────────────────
+        ch_vol = _convex_hull_volume(coords)
+        row["convex_hull_volume_vox"] = ch_vol
+        row["convexness"] = (n_vox / ch_vol) if ch_vol > 0 else np.nan
+
+        # ── Surface area & sphericity ────────────────────────────────────────
+        sa = _surface_area_mm2(mask, voxel_sizes)
+        row["surface_area_mm2"]    = sa
+        row["surface_volume_ratio"] = (
+            sa / vol_mm3 if (not np.isnan(sa) and vol_mm3 > 0) else np.nan
+        )
+        if not np.isnan(sa) and sa > 0:
+            row["sphericity"] = (np.pi ** (1 / 3) * (6 * vol_mm3) ** (2 / 3)) / sa
+        else:
+            row["sphericity"] = np.nan
+
+        # ── Inertia tensor & derived shape ratios ────────────────────────────
+        eigvals_3d = np.sort(rp.inertia_tensor_eigvals)[::-1]  # λ1 ≥ λ2 ≥ λ3
+        lam1, lam2, lam3 = eigvals_3d
+        row.update({
+            "inertia_eigval_1": float(lam1),
+            "inertia_eigval_2": float(lam2),
+            "inertia_eigval_3": float(lam3),
+            "elongation": float(np.sqrt(lam2 / lam1)) if lam1 > 0 else np.nan,
+            "flatness":   float(np.sqrt(lam3 / lam1)) if lam1 > 0 else np.nan,
+            "isotropy":   float(lam3 / lam1)           if lam1 > 0 else np.nan,
+        })
+
+        # ── Topology ─────────────────────────────────────────────────────────
+        row["euler_number"] = int(euler_number(mask, connectivity=3))
+
+        # ── Inter-lesion distance ─────────────────────────────────────────────
+        others = [c for lv, c in centroids.items() if lv != label_val]
+        if others:
+            dists = [
+                np.linalg.norm(np.array(com_vox) - np.array(c)) for c in others
+            ]
+            row["nearest_lesion_dist_vox"] = float(min(dists))
+        else:
+            row["nearest_lesion_dist_vox"] = np.nan
+
+        # ── 4D inertia (spatial + intensity) per modality ────────────────────
+        for name, arr in mod_arrays.items():
+            eigvals_4d, _ = _compute_4d_inertia(coords, arr[mask])
+            if eigvals_4d is not None:
+                for i, ev in enumerate(eigvals_4d, 1):
+                    row[f"inertia_4d_{name}_eigval_{i}"] = float(ev)
+            else:
+                for i in range(1, 5):
+                    row[f"inertia_4d_{name}_eigval_{i}"] = np.nan
+
+        # ── Intensity statistics per modality ─────────────────────────────────
+        for name, arr in mod_arrays.items():
+            vals = arr[mask]
+            row.update(_intensity_stats(vals, prefix=name))
+            row.update(_boundary_gradient_stats(arr, mask, prefix=name))
+            if name in nawm_stats:
+                nm, ns = nawm_stats[name]
+                row[f"{name}_nawm_norm_mean"] = (
+                    (float(np.mean(vals)) - nm) / ns if ns > 0 else np.nan
+                )
+
+        # ── Pairwise modality ratios & correlation ────────────────────────────
+        for n1, n2 in combinations(mod_names, 2):
+            v1 = mod_arrays[n1][mask]
+            v2 = mod_arrays[n2][mask]
+            m2 = float(np.mean(v2))
+            row[f"{n1}_over_{n2}_mean_ratio"] = (
+                float(np.mean(v1)) / m2 if m2 != 0 else np.nan
+            )
+            row[f"{n1}_{n2}_correlation"] = (
+                float(np.corrcoef(v1, v2)[0, 1]) if v1.size > 1 else np.nan
+            )
+
+        # ── PyRadiomics texture features ──────────────────────────────────────
+        for name, arr in mod_arrays.items():
+            row.update(
+                _radiomics_features(mask, arr, header, prefix=name, extractor=extractor)
+            )
+
+        # ── Probabilistic segmentation features ──────────────────────────────
+        if prob_data is not None:
+            probs = prob_data[mask]
+            row.update({
+                "fuzzy_volume_vox":    float(np.sum(probs)),
+                "mean_confidence":     float(np.mean(probs)),
+                "std_confidence":      float(np.std(probs)),
+                "prob_weighted_com_x": float(np.average(coords[:, 0], weights=probs)),
+                "prob_weighted_com_y": float(np.average(coords[:, 1], weights=probs)),
+                "prob_weighted_com_z": float(np.average(coords[:, 2], weights=probs)),
+                "prob_entropy":        float(stats.entropy(probs + 1e-9)),
+                "core_volume_vox":     int(np.sum(probs > 0.9)),
+                "rim_volume_vox":      int(np.sum((probs > 0.3) & (probs < 0.7))),
+            })
+
+        results.append(row)
+
+    return pd.DataFrame(results)

@@ -15,6 +15,7 @@ dependencies = [
     "pandas>=2.0",
     "SimpleITK>=2.3",
     "trimesh>=3.21",
+    "matplotlib>=3.7",
 ]
 
 [project.optional-dependencies]

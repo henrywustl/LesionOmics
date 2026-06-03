@@ -5,6 +5,7 @@ scipy>=1.11
 pandas>=2.0
 SimpleITK>=2.3
 trimesh>=3.21
+matplotlib>=3.7
 pytest>=7.0
 
 # Transitive dependencies required by torch / deepbet when present in the environment

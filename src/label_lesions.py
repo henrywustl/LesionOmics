@@ -130,12 +130,15 @@ def watershed_confluent_lesion_splitting(
 def random_walker_confluent_lesion_splitting(labeled_array: np.ndarray) -> np.ndarray:
     """Split confluent lesions via random-walker segmentation.
 
-    Uses the same erosion-derived seeds as the erosion method, but expands
-    regions through a diffusion (random-walk) process on the Euclidean
-    distance transform rather than nearest-neighbour assignment. The
-    probabilistic boundary placement tends to produce smoother, more
+    Uses the same erosion-derived seeds as the erosion method, but assigns
+    unlabeled foreground voxels through a diffusion (random-walk) process on
+    the Euclidean distance transform rather than nearest-neighbour assignment.
+    The probabilistic boundary placement tends to produce smoother, more
     natural-looking splits than Voronoi expansion, and is less sensitive to
     seed placement than the watershed approach.
+
+    To keep run-time tractable on clinical-size volumes, each connected
+    component is processed independently within its own tight bounding box.
 
     Falls back to erosion-Voronoi if scikit-image's random_walker is
     unavailable or raises an exception.
@@ -160,29 +163,59 @@ def random_walker_confluent_lesion_splitting(labeled_array: np.ndarray) -> np.nd
         return labeled_array.copy()
 
     binary = labeled_array > 0
-    seed_labels = _find_erosion_seeds(binary)
-    n_seeds = int(seed_labels.max())
+    component_labels = skimage.measure.label(binary, connectivity=3)
+    n_components = int(component_labels.max())
+    result = np.zeros_like(labeled_array, dtype=np.int32)
+    global_label = 0
 
-    if n_seeds == 0:
-        return labeled_array.copy()
+    for comp_id in range(1, n_components + 1):
+        comp_mask = component_labels == comp_id
 
-    # If every foreground voxel is already covered by a seed, skip the walker
-    if np.all(seed_labels[binary] > 0):
-        result = np.where(binary, seed_labels, 0).astype(np.int32)
-        return relabel_from_largest_to_smallest(result)
+        # Crop to bounding box (+ 1 voxel padding) for speed
+        coords = np.column_stack(np.where(comp_mask))
+        lo = np.maximum(coords.min(axis=0) - 1, 0)
+        hi = np.minimum(coords.max(axis=0) + 2, np.array(binary.shape))
+        slices = tuple(slice(int(l), int(h)) for l, h in zip(lo, hi))
 
-    # Use the DT as image data so the walker is guided toward region centres
-    dist = distance_transform_edt(binary).astype(np.float64)
+        sub_mask = comp_mask[slices]
+        sub_seeds = _find_erosion_seeds(sub_mask)
 
-    try:
-        walked = _rw(dist, seed_labels, beta=10, mode="bf")
-        result = np.where(binary, walked, 0).astype(np.int32)
-        return relabel_from_largest_to_smallest(result)
-    except Exception as exc:
-        logger.warning(
-            "random_walker failed (%s); falling back to erosion method.", exc
-        )
-        return erosion_derived_confluent_lesion_splitting(labeled_array)
+        if int(sub_seeds.max()) == 0:
+            global_label += 1
+            result[comp_mask] = global_label
+            continue
+
+        if np.all(sub_seeds[sub_mask] > 0):
+            sub_result = np.where(sub_mask, sub_seeds, 0).astype(np.int32)
+        else:
+            sub_dist = distance_transform_edt(sub_mask).astype(np.float64)
+            sub_result = None
+            # Conjugate-gradient solvers are O(N log N); brute-force is O(N³)
+            for mode in ("cg_j", "cg", "bf"):
+                try:
+                    walked = _rw(sub_dist, sub_seeds, beta=10, mode=mode)
+                    sub_result = np.where(sub_mask, walked, 0).astype(np.int32)
+                    break
+                except Exception as exc:
+                    logger.debug(
+                        "random_walker mode=%s failed for component %d (%s).",
+                        mode, comp_id, exc,
+                    )
+            if sub_result is None:
+                logger.warning(
+                    "random_walker failed for component %d; "
+                    "using Voronoi fallback for this component.", comp_id,
+                )
+                sub_result = np.where(sub_mask, sub_seeds, 0).astype(np.int32)
+
+        # Map local labels (1..k) to globally unique labels
+        for local_lbl in range(1, int(sub_result.max()) + 1):
+            global_label += 1
+            local_vox = np.where(sub_result == local_lbl)
+            full_vox = tuple(lo[d] + local_vox[d] for d in range(3))
+            result[full_vox] = global_label
+
+    return relabel_from_largest_to_smallest(result)
 
 
 # Registry — extend here to add future methods

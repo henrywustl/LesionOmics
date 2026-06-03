@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "lesionomics"
+version = "0.1.0"
+description = "Modality-agnostic lesion quantification from NIfTI neuroimages"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "nibabel>=5.0",
+    "scikit-image>=0.21",
+    "scipy>=1.11",
+    "pandas>=2.0",
+    "SimpleITK>=2.3",
+    "trimesh>=3.21",
+]
+
+[project.optional-dependencies]
+radiomics = ["pyradiomics>=3.1"]
+ants = ["antspyx>=0.4.2"]
+dev = ["pytest>=7.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-v", "--tb=short"]

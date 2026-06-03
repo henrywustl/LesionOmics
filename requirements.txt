@@ -1,0 +1,14 @@
+numpy>=1.24
+nibabel>=5.0
+scikit-image>=0.21
+scipy>=1.11
+pandas>=2.0
+SimpleITK>=2.3
+trimesh>=3.21
+pytest>=7.0
+
+# Optional — install for texture features:
+# pyradiomics>=3.1
+
+# Optional — install for Jacobian pipeline:
+# antspyx>=0.4.2

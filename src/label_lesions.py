@@ -1,109 +1,108 @@
+import logging
+
 import numpy as np
 import nibabel as nib
 import skimage.measure
 from skimage.measure import label, regionprops
-from scipy.ndimage import binary_erosion, binary_dilation, distance_transform_edt
+from scipy.ndimage import binary_erosion, distance_transform_edt
+
+logger = logging.getLogger(__name__)
 
 
-def relabel_from_largest_to_smallest(labeled_array):
-    """
-    Given a labeled_array (integer labels), this function reassigns 
-    labels from 1..N in decreasing order of blob size (largest->smallest).
-    """
-    # Extract region properties
+def relabel_from_largest_to_smallest(labeled_array: np.ndarray) -> np.ndarray:
+    """Reassign labels 1..N in decreasing order of blob size (largest → label 1)."""
     props = regionprops(labeled_array)
-    
-    # Sort regions by area (descending order)
-    areas = [prop.area for prop in props]
-    sorted_indices = np.argsort(areas)[::-1]  # largest first
-    
-    # Reassign labels
+    if not props:
+        return labeled_array.copy()
+
+    sorted_props = sorted(props, key=lambda p: p.area, reverse=True)
     new_labeled = np.zeros_like(labeled_array)
-    for new_label, idx in enumerate(sorted_indices, start=1):
-        old_label = props[idx].label
-        new_labeled[labeled_array == old_label] = new_label
-        
+    for new_val, prop in enumerate(sorted_props, start=1):
+        new_labeled[labeled_array == prop.label] = new_val
+
     return new_labeled
 
-def erosion_derived_confluent_lesion_splitting(labeled_array):
-    """
-    Split confluent lesions by eroding to minimal center points and expanding back.
+
+def erosion_derived_confluent_lesion_splitting(labeled_array: np.ndarray) -> np.ndarray:
+    """Split confluent lesions via iterative erosion then Voronoi expansion.
+
+    Erodes the binary union of all labeled voxels until connected components
+    either split (n_eroded > n_current) or a component would be eliminated
+    (n_eroded < n_current). The eroded state at that point serves as Voronoi
+    seeds; each original voxel is assigned to its nearest seed.
 
     Args:
-        labeled_array (ndarray): Input array with integer labels for different regions
+        labeled_array: Integer-labeled array (0 = background).
 
     Returns:
-        ndarray: New labeled array with split regions based on center points
+        New labeled array with the same foreground voxels, relabeled
+        largest-to-smallest after splitting.
     """
-    # Extract region properties
-    props = regionprops(labeled_array)
+    if not np.any(labeled_array):
+        return labeled_array.copy()
 
-    # Initialize arrays
-    original_volume = np.zeros_like(labeled_array, dtype=bool)
-    center_points = np.zeros_like(labeled_array, dtype=bool)
-
-    # Store original volume
-    for prop in props:
-        original_volume |= (labeled_array == prop.label)
-
-    # Erode to center points
+    original_volume = labeled_array > 0
     current_state = original_volume.copy()
+    n_current = skimage.measure.label(current_state, connectivity=3).max()
+
     while True:
         eroded = binary_erosion(current_state)
-        labeled_eroded = skimage.measure.label(eroded, connectivity=3)
+        if not np.any(eroded):
+            break
 
-        # Check if further erosion would eliminate any region completely
-        if np.sum(eroded) == 0 or skimage.measure.label(eroded, connectivity=3).max() != skimage.measure.label(current_state, connectivity=3).max():
-            center_points = current_state
+        n_eroded = int(skimage.measure.label(eroded, connectivity=3).max())
+
+        if n_eroded > n_current:
+            # Erosion revealed separate sub-regions — use them as centre seeds
+            current_state = eroded
+            break
+        if n_eroded < n_current:
+            # A component would vanish — keep current_state as seeds
             break
 
         current_state = eroded
+        n_current = n_eroded
 
-    # Label center points
-    center_labels = skimage.measure.label(center_points, connectivity=3)
-    center_labels = relabel_from_largest_to_smallest(center_labels)
+    center_labels = skimage.measure.label(current_state, connectivity=3)
+    n_centers = int(center_labels.max())
 
-    # Create distance maps for expansion
-    distance_maps = {}
-    for i in range(1, center_labels.max() + 1):
-        distance_maps[i] = distance_transform_edt(~(center_labels == i))
+    if n_centers == 0:
+        return labeled_array.copy()
 
-    # Assign original volume to nearest center point
-    result = np.zeros_like(labeled_array)
-    unassigned = original_volume.copy()
+    # Voronoi expansion: EDT from each center, assign each foreground voxel
+    # to whichever center it is nearest to
+    dist_maps = np.zeros((n_centers, *original_volume.shape), dtype=np.float32)
+    for i in range(1, n_centers + 1):
+        dist_maps[i - 1] = distance_transform_edt(center_labels != i)
 
-    while np.any(unassigned):
-        min_dist = np.inf
-        best_label = None
+    nearest_center = np.argmin(dist_maps, axis=0) + 1  # 1-indexed
+    result = np.where(original_volume, nearest_center, 0).astype(np.int32)
 
-        for label, dist_map in distance_maps.items():
-            dist = dist_map[unassigned]
-            if dist.min() < min_dist:
-                min_dist = dist.min()
-                best_label = label
-
-        assign_mask = unassigned & (distance_maps[best_label] == min_dist)
-        result[assign_mask] = best_label
-        unassigned[assign_mask] = False
-
-    return result
+    return relabel_from_largest_to_smallest(result)
 
 
-# 1) Load the NIfTI file
-input_nii = nib.load("input.nii.gz")
-data = input_nii.get_fdata()
+def label_lesions(
+    input_img: nib.Nifti1Image,
+    threshold: float = 0.3,
+    split_confluent: bool = False,
+) -> nib.Nifti1Image:
+    """Label connected lesion components in a NIfTI image.
 
-# 2) Threshold at 0.4 to create a binary mask
-binary_data = data > 0.3
+    Args:
+        input_img: Probability or binary lesion map.
+        threshold: Voxels above this value are considered lesion.
+        split_confluent: If True, attempt to split confluent lesions via erosion.
 
-# 3) Label connected components in 3D
-#    connectivity=3 ensures 6-connectivity in 3D
-labeled_data = label(binary_data, connectivity=3)
+    Returns:
+        NIfTI image with integer labels (0 = background, 1..N = lesions,
+        sorted largest-first).
+    """
+    data = input_img.get_fdata()
+    binary_mask = data > threshold
+    labeled = label(binary_mask, connectivity=3)
+    labeled = relabel_from_largest_to_smallest(labeled)
 
-# 4) Re-label blobs from largest to smallest
-re_labeled_data = relabel_from_largest_to_smallest(labeled_data)
+    if split_confluent and np.any(labeled):
+        labeled = erosion_derived_confluent_lesion_splitting(labeled)
 
-# 5) Save as a new NIfTI image
-out_nii = nib.Nifti1Image(re_labeled_data.astype(np.int32), input_nii.affine, input_nii.header)
-nib.save(out_nii, "output_labeled.nii.gz")
-
+    return nib.Nifti1Image(labeled.astype(np.int32), input_img.affine, input_img.header)

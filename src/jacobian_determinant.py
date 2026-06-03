@@ -1,91 +1,193 @@
-"""This module implements the Jacobian Determinant image processing pipeline outlined in `Slowly expanding/evolving
-lesions as a magnetic resonance imaging marker of chronic active multiple sclerosis lesions
-<https://doi.org/10.1177/1352458518814117>`_ and `Jacobian integration method increases the statistical power to
-measure gray matter atrophy in multiple sclerosis <https://doi.org/10.1016/j.nicl.2013.10.015>`_."""
+"""Jacobian determinant pipeline for lesion volumetric-change analysis.
 
-import ants
+Implements the approach from:
+- Slowly expanding/evolving lesions as an MRI marker of chronic active MS
+  (doi:10.1177/1352458518814117)
+- Jacobian integration method increases statistical power to measure GM atrophy in MS
+  (doi:10.1016/j.nicl.2013.10.015)
+"""
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+try:
+    import ants
+    _ANTS_AVAILABLE = True
+except ImportError:
+    _ANTS_AVAILABLE = False
+    logger.warning("antspyx not installed; Jacobian pipeline unavailable.")
 
 
-def resample_to_isotropic(image: ants.ANTsImage, voxel_size: float = 1.0) -> ants.ANTsImage:
+def _require_ants():
+    if not _ANTS_AVAILABLE:
+        raise ImportError(
+            "antspyx is required for the Jacobian pipeline. "
+            "Install it with: pip install antspyx"
+        )
+
+
+def resample_to_isotropic(image: "ants.ANTsImage", voxel_size: float = 1.0) -> "ants.ANTsImage":
     """Resample image to isotropic voxel dimensions.
 
     Args:
-        image (ants.ANTsImage): The image to be resampled.
-        voxel_size (float): The desired voxel size in millimeters for all dimensions.
+        image: The image to resample.
+        voxel_size: Desired isotropic voxel size in mm.
 
     Returns:
-        ants.ANTsImage: The resampled image.
+        Resampled ANTsImage.
     """
-    return ants.resample_image(image, resample_params=(voxel_size, voxel_size, voxel_size), use_voxels=False)
+    _require_ants()
+    return ants.resample_image(
+        image,
+        resample_params=(voxel_size, voxel_size, voxel_size),
+        use_voxels=False,
+    )
 
 
-def register_to_halfway_space(fixed_image: ants.ANTsImage, moving_image: ants.ANTsImage) -> (ants.ANTsImage, ants.ANTsImage):
-    """
-    Perform affine registration to a halfway space between two images.
+def register_to_halfway_space(
+    fixed_image: "ants.ANTsImage",
+    moving_image: "ants.ANTsImage",
+) -> tuple:
+    """Affine registration to a halfway space between two images.
 
     Args:
-        fixed_image (ants.ANTsImage): The reference image.
-        moving_image (ants.ANTsImage): The image to be aligned to the reference.
+        fixed_image: Reference image (e.g. baseline T1).
+        moving_image: Image to align (e.g. follow-up T1).
 
     Returns:
-        tuple: A tuple containing the two images transformed into the halfway space.
+        Tuple of (halfway_fixed, halfway_moving) in the halfway space.
     """
-    registration_fixed_to_moving = ants.registration(fixed=fixed_image, moving=moving_image, type_of_transform='Affine')
+    _require_ants()
+    reg_f2m = ants.registration(fixed=fixed_image, moving=moving_image, type_of_transform="Affine")
+    reg_m2f = ants.registration(fixed=moving_image, moving=fixed_image, type_of_transform="Affine")
 
-    registration_moving_to_fixed = ants.registration(fixed=moving_image, moving=fixed_image, type_of_transform='Affine')
-
-    halfway_fixed = ants.apply_transforms(fixed=fixed_image, moving=fixed_image,
-                                          transformlist=registration_moving_to_fixed['fwdtransforms'],
-                                          whichtoinvert=[True], interpolator='linear')
-    halfway_moving = ants.apply_transforms(fixed=moving_image, moving=moving_image,
-                                           transformlist=registration_fixed_to_moving['fwdtransforms'],
-                                           whichtoinvert=[True], interpolator='linear')
-
+    halfway_fixed = ants.apply_transforms(
+        fixed=fixed_image,
+        moving=fixed_image,
+        transformlist=reg_m2f["fwdtransforms"],
+        whichtoinvert=[True],
+        interpolator="linear",
+    )
+    halfway_moving = ants.apply_transforms(
+        fixed=moving_image,
+        moving=moving_image,
+        transformlist=reg_f2m["fwdtransforms"],
+        whichtoinvert=[True],
+        interpolator="linear",
+    )
     return halfway_fixed, halfway_moving
 
-def nonlinear_registration(fixed_image: ants.ANTsImage, moving_image: ants.ANTsImage,
-                           additional_image: ants.ANTsImage, step_size: float = 0.7,
-                           gaussian_sigma: float = 2) -> dict:
-    """Perform non-linear registration with specific parameters using multiple modalities.
+
+def nonlinear_registration(
+    fixed_image: "ants.ANTsImage",
+    moving_image: "ants.ANTsImage",
+    fixed_auxiliary: "ants.ANTsImage" = None,
+    moving_auxiliary: "ants.ANTsImage" = None,
+    step_size: float = 0.7,
+    gaussian_sigma: float = 2,
+) -> dict:
+    """SyN non-linear registration, optionally incorporating an auxiliary modality.
 
     Args:
-        fixed_image (ants.ANTsImage): The fixed reference image (T1-weighted).
-        moving_image (ants.ANTsImage): The moving image (T1-weighted) to be registered.
-        additional_image (ants.ANTsImage): An additional modality (T2-weighted) that needs to be
-                                           incorporated into the registration process.
-        step_size (float): Step size for the registration.
-        gaussian_sigma (float): Gaussian sigma for smoothing in registration.
+        fixed_image: Fixed reference image (T1).
+        moving_image: Moving image (T1).
+        fixed_auxiliary: Optional auxiliary modality for fixed (e.g. T2).
+        moving_auxiliary: Optional auxiliary modality for moving (e.g. T2).
+        step_size: SyN gradient step size.
+        gaussian_sigma: Gaussian smoothing sigma.
 
     Returns:
-        dict: The registration result including transformations.
+        ANTs registration result dict (contains 'fwdtransforms', etc.).
     """
-    # Combining both T1 and T2 images for registration; this assumes both images are aligned.
-    combined_fixed = ants.image_math(fixed_image, "add", additional_image)
-    combined_moving = ants.image_math(moving_image, "add", additional_image)
-    return ants.registration(combined_fixed, combined_moving, type_of_transform='SyN',
-                             reg_iterations=(40, 20, 0), transformation_parameters=(step_size, gaussian_sigma))
+    _require_ants()
+    if fixed_auxiliary is not None and moving_auxiliary is not None:
+        combined_fixed = fixed_image + fixed_auxiliary
+        combined_moving = moving_image + moving_auxiliary
+    else:
+        combined_fixed = fixed_image
+        combined_moving = moving_image
+
+    return ants.registration(
+        combined_fixed,
+        combined_moving,
+        type_of_transform="SyN",
+        reg_iterations=(40, 20, 0),
+        transformation_parameters=(step_size, gaussian_sigma),
+    )
 
 
-def compute_jacobian_determinant(tx: ants.ANTsTransform) -> ants.ANTsImage:
-    """Compute the Jacobian determinant of the deformation field.
+def compute_jacobian_determinant(
+    domain_image: "ants.ANTsImage",
+    transform_path: str,
+) -> "ants.ANTsImage":
+    """Compute the Jacobian determinant of a displacement field.
 
     Args:
-        tx (ants.ANTsTransform): The transformation for which to compute the Jacobian determinant.
+        domain_image: Image defining the domain (resolution/space).
+        transform_path: Path to the displacement field transform file.
 
     Returns:
-        ants.ANTsImage: The Jacobian determinant image.
+        Jacobian determinant image (values > 1 = local expansion, < 1 = contraction).
     """
-    return ants.create_jacobian_determinant_image(tx, do_log=False)
+    _require_ants()
+    return ants.create_jacobian_determinant_image(domain_image, transform_path, do_log=False)
 
 
-def resample_jacobian_determinant(jacobian_image: ants.ANTsImage, original_image: ants.ANTsImage) -> ants.ANTsImage:
-    """Resample the Jacobian determinant image to the original resolution.
+def resample_jacobian_determinant(
+    jacobian_image: "ants.ANTsImage",
+    original_image: "ants.ANTsImage",
+) -> "ants.ANTsImage":
+    """Resample a Jacobian image back to the original image resolution.
 
     Args:
-        jacobian_image (ants.ANTsImage): The Jacobian determinant image to resample.
-        original_image (ants.ANTsImage): The image whose resolution will be matched.
+        jacobian_image: Jacobian determinant image to resample.
+        original_image: Target resolution image.
 
     Returns:
-        ants.ANTsImage: The resampled Jacobian determinant image.
+        Resampled Jacobian determinant image.
     """
-    return ants.resample_image_to_target(jacobian_image, original_image, interp_type='linear')
+    _require_ants()
+    return ants.resample_image_to_target(jacobian_image, original_image, interp_type="linear")
+
+
+def compute_lesion_jacobian_pipeline(
+    t1_fixed: "ants.ANTsImage",
+    t1_moving: "ants.ANTsImage",
+    t2_fixed: "ants.ANTsImage" = None,
+    t2_moving: "ants.ANTsImage" = None,
+    voxel_size: float = 1.0,
+) -> "ants.ANTsImage":
+    """End-to-end Jacobian pipeline for lesion volumetric change.
+
+    Resamples to isotropic, registers to halfway space, performs SyN, and
+    returns the Jacobian determinant resampled to the original T1 space.
+
+    Args:
+        t1_fixed: Baseline T1 image.
+        t1_moving: Follow-up T1 image.
+        t2_fixed: Optional baseline T2 (for multi-modal registration).
+        t2_moving: Optional follow-up T2.
+        voxel_size: Isotropic voxel size for resampling before registration.
+
+    Returns:
+        Jacobian determinant image in the original T1 space.
+    """
+    _require_ants()
+    t1_f = resample_to_isotropic(t1_fixed, voxel_size)
+    t1_m = resample_to_isotropic(t1_moving, voxel_size)
+    t2_f = resample_to_isotropic(t2_fixed, voxel_size) if t2_fixed is not None else None
+    t2_m = resample_to_isotropic(t2_moving, voxel_size) if t2_moving is not None else None
+
+    halfway_fixed, halfway_moving = register_to_halfway_space(t1_f, t1_m)
+
+    reg = nonlinear_registration(
+        halfway_fixed,
+        halfway_moving,
+        fixed_auxiliary=t2_f,
+        moving_auxiliary=t2_m,
+    )
+
+    syn_transform = reg["fwdtransforms"][0]
+    jacobian = compute_jacobian_determinant(halfway_fixed, syn_transform)
+    return resample_jacobian_determinant(jacobian, t1_fixed)

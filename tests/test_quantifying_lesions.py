@@ -18,14 +18,11 @@ from src.quantifying_lesions import (
 
 # Expected column sets for structural assertions
 SHAPE_COLS = {
-    "volume_vox", "volume_mm3",
-    "bbox_z_min", "bbox_z_max", "bbox_y_min", "bbox_y_max", "bbox_x_min", "bbox_x_max",
-    "com_vox_z", "com_vox_y", "com_vox_x",
+    "volume_mm3",
     "com_mm_z", "com_mm_y", "com_mm_x",
     "convex_hull_volume_mm3", "solidity",
     "surface_area_mm2", "sphericity",
     "curvature_mean", "curvature_std", "curvature_abs_max",
-    "inertia_eigval_0", "inertia_eigval_1", "inertia_eigval_2",
     "elongation", "flatness", "isotropy",
     "euler_number",
     "nearest_lesion_dist_mm",
@@ -33,10 +30,11 @@ SHAPE_COLS = {
     "mean_dist_to_all_lesions_mm",
 }
 
+# Removed from INTENSITY_STATS: var (=std²), cv (=std/mean), rms,
+# moment5, p10, p25, p75, p90 (iqr + min/max sufficient).
 INTENSITY_STATS = {
-    "mean", "median", "mode", "min", "max", "var", "std",
-    "skewness", "kurtosis", "moment5", "entropy",
-    "p10", "p25", "p75", "p90", "iqr", "rms", "cv", "energy",
+    "mean", "median", "mode", "min", "max", "std",
+    "skewness", "kurtosis", "entropy", "iqr", "energy",
 }
 
 
@@ -109,10 +107,10 @@ class TestSurfaceCurvatureStats:
 
 
 class TestIntensityStats:
-    def test_returns_19_stats(self):
+    def test_returns_11_stats(self):
         vals = np.random.default_rng(0).normal(100, 10, 200).astype(np.float32)
         result = _intensity_stats(vals, "T1")
-        assert len(result) == 19
+        assert len(result) == 11
 
     def test_empty_vals_all_nan(self):
         result = _intensity_stats(np.array([]), "T1")
@@ -193,7 +191,6 @@ class TestConcentricShellStats:
         for i in range(3):
             assert f"T1_shell_{i}_mean" in result
             assert f"T1_shell_{i}_std" in result
-            assert f"T1_shell_{i}_n_vox" in result
         assert "T1_rim_core_ratio" in result
         assert "T1_shell_gradient_slope" in result
         assert "T1_shell_gradient_r2" in result
@@ -274,9 +271,9 @@ class TestQuantifyLesions:
     def test_volume_matches_sphere_approximately(self, synthetic_dataset):
         ds = synthetic_dataset
         df = quantify_lesions(ds["labeled_img"], ds["modalities"], include_radiomics=False)
-        # Lesion 1 (r=7): expected ~1437 vox; Lesion 2 (r=4): ~268 vox
-        vol1 = df.loc[df["label"] == 1, "volume_vox"].iloc[0]
-        vol2 = df.loc[df["label"] == 2, "volume_vox"].iloc[0]
+        # Lesion 1 (r=7): expected ~1437 mm³; Lesion 2 (r=4): ~268 mm³ (1 mm isotropic)
+        vol1 = df.loc[df["label"] == 1, "volume_mm3"].iloc[0]
+        vol2 = df.loc[df["label"] == 2, "volume_mm3"].iloc[0]
         expected1 = (4 / 3) * np.pi * 7 ** 3
         expected2 = (4 / 3) * np.pi * 4 ** 3
         assert vol1 == pytest.approx(expected1, rel=0.15)
@@ -285,8 +282,8 @@ class TestQuantifyLesions:
     def test_lesion1_larger_than_lesion2(self, synthetic_dataset):
         ds = synthetic_dataset
         df = quantify_lesions(ds["labeled_img"], ds["modalities"], include_radiomics=False)
-        v1 = df.loc[df["label"] == 1, "volume_vox"].iloc[0]
-        v2 = df.loc[df["label"] == 2, "volume_vox"].iloc[0]
+        v1 = df.loc[df["label"] == 1, "volume_mm3"].iloc[0]
+        v2 = df.loc[df["label"] == 2, "volume_mm3"].iloc[0]
         assert v1 > v2
 
     def test_intensity_mean_close_to_800(self, synthetic_dataset):
@@ -390,7 +387,7 @@ class TestQuantifyLesions:
     def test_no_nan_in_core_columns(self, synthetic_dataset):
         ds = synthetic_dataset
         df = quantify_lesions(ds["labeled_img"], ds["modalities"], include_radiomics=False)
-        core_cols = ["volume_vox", "volume_mm3", "T1_mean", "T2_mean",
+        core_cols = ["volume_mm3", "T1_mean", "T2_mean",
                      "sphericity", "surface_area_mm2"]
         for col in core_cols:
             assert not df[col].isna().any(), f"NaN found in {col}"

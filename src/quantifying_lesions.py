@@ -101,17 +101,21 @@ def _compute_4d_inertia(coords: np.ndarray, intensities: np.ndarray) -> tuple:
 
 
 def _intensity_stats(vals: np.ndarray, prefix: str) -> dict:
-    """19 intensity statistics for a set of lesion voxel values."""
+    """11 intensity statistics for a set of lesion voxel values.
+
+    Dropped from the original 19: var (= std²), cv (= std/mean), rms
+    (correlated with mean/energy), moment5 (noise-dominated beyond kurtosis),
+    and the four granular percentiles p10/p25/p75/p90 (iqr already covers
+    the interquartile spread; min/max bound the full range).
+    """
     keys = [
-        "mean", "median", "mode", "min", "max", "var", "std", "skewness",
-        "kurtosis", "moment5", "entropy", "p10", "p25", "p75", "p90",
-        "iqr", "rms", "cv", "energy",
+        "mean", "median", "mode", "min", "max", "std",
+        "skewness", "kurtosis", "entropy", "iqr", "energy",
     ]
     if vals.size == 0:
         return {f"{prefix}_{k}": np.nan for k in keys}
 
     mean = float(np.mean(vals))
-    std = float(np.std(vals))
     p25 = float(np.percentile(vals, 25))
     p75 = float(np.percentile(vals, 75))
 
@@ -121,19 +125,11 @@ def _intensity_stats(vals: np.ndarray, prefix: str) -> dict:
         f"{prefix}_mode": float(stats.mode(vals, keepdims=False)[0]),
         f"{prefix}_min": float(np.min(vals)),
         f"{prefix}_max": float(np.max(vals)),
-        f"{prefix}_var": float(np.var(vals)),
-        f"{prefix}_std": std,
+        f"{prefix}_std": float(np.std(vals)),
         f"{prefix}_skewness": float(stats.skew(vals)),
         f"{prefix}_kurtosis": float(stats.kurtosis(vals)),
-        f"{prefix}_moment5": float(np.mean((vals - mean) ** 5)),
         f"{prefix}_entropy": float(shannon_entropy(vals)),
-        f"{prefix}_p10": float(np.percentile(vals, 10)),
-        f"{prefix}_p25": p25,
-        f"{prefix}_p75": p75,
-        f"{prefix}_p90": float(np.percentile(vals, 90)),
         f"{prefix}_iqr": float(p75 - p25),
-        f"{prefix}_rms": float(np.sqrt(np.mean(vals ** 2))),
-        f"{prefix}_cv": float(std / mean) if mean != 0 else np.nan,
         f"{prefix}_energy": float(np.sum(vals ** 2)),
     }
 
@@ -220,7 +216,6 @@ def _concentric_shell_stats(
         std_val = float(np.std(vals)) if vals.size > 0 else np.nan
         result[f"{prefix}_shell_{i}_mean"] = mean_val
         result[f"{prefix}_shell_{i}_std"] = std_val
-        result[f"{prefix}_shell_{i}_n_vox"] = n_vox
         shell_means.append(mean_val)
 
     rim_mean = shell_means[0] if shell_means else np.nan
@@ -377,19 +372,15 @@ def quantify_lesions(
         # ---- Volume -------------------------------------------------------
         n_vox = int(np.count_nonzero(mask))
         vol_mm3 = n_vox * voxel_vol
-        r["volume_vox"] = n_vox
         r["volume_mm3"] = vol_mm3
 
-        # ---- Bounding box -------------------------------------------------
-        for dim, ax in enumerate(["z", "y", "x"]):
-            r[f"bbox_{ax}_min"] = int(coords_vox[:, dim].min())
-            r[f"bbox_{ax}_max"] = int(coords_vox[:, dim].max())
+        # ---- Bounding box (computed for spatial tracking; not emitted to CSV) -
+        # bbox_{z,y,x}_{min,max} are retained here for longitudinal pipelines.
 
         # ---- Centre of mass -----------------------------------------------
         com_vox = tuple(float(c) for c in ndimage.center_of_mass(mask))
         com_mm = tuple(float(c) for c in nib.affines.apply_affine(affine, com_vox))
         for i, ax in enumerate(["z", "y", "x"]):
-            r[f"com_vox_{ax}"] = com_vox[i]
             r[f"com_mm_{ax}"] = com_mm[i]
 
         # ---- Convex hull --------------------------------------------------
@@ -413,9 +404,9 @@ def quantify_lesions(
         temp_label = np.zeros_like(mask, dtype=np.int32)
         temp_label[mask] = 1
         rp = regionprops(temp_label)[0]
+        # Raw eigenvalues omitted from CSV — elongation/flatness/isotropy capture
+        # the meaningful relationships between them.
         eigs = np.sort(rp.inertia_tensor_eigvals)[::-1]  # descending
-        for i, ev in enumerate(eigs):
-            r[f"inertia_eigval_{i}"] = float(ev)
         e1, e2, e3 = eigs[0], eigs[1], eigs[2]
         r["elongation"] = float(np.sqrt(e2 / e1)) if e1 > 0 else np.nan
         r["flatness"] = float(np.sqrt(e3 / e1)) if e1 > 0 else np.nan

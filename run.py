@@ -1,183 +1,179 @@
 #!/usr/bin/env python3
-"""
-LesionOmics end-to-end pipeline.
+"""End-to-end lesion quantification pipeline.
 
-Labels lesions from a probability map, quantifies per-lesion features across
-any set of co-registered 3D modality images, and writes a CSV of measurements.
-
-Default usage (sample data in data/):
+Usage
+-----
+Basic (uses data/ directory defaults):
     python run.py
 
-Custom usage:
+Custom modalities:
+    python run.py --modalities T1=data/T1.nii.gz T2=data/T2.nii.gz
+
+All options:
     python run.py \\
-        --prob-map  path/to/prob.nii.gz \\
-        --modalities T1=path/to/T1.nii.gz T2=path/to/T2.nii.gz \\
-        --output    lesion_measurements.csv
+        --seg data/truenet.nii.gz \\
+        --modalities T1=data/T1.nii.gz T2=data/T2.nii.gz \\
+        --threshold 0.3 \\
+        --split-confluent \\
+        --nawm-mask nawm.nii.gz \\
+        --jacobian-map jac.nii.gz \\
+        --prob-map data/truenet.nii.gz \\
+        --n-shells 5 \\
+        --no-radiomics \\
+        --wavelet \\
+        --log \\
+        --output results.csv
 """
 
 import argparse
+import logging
 import sys
-import time
 from pathlib import Path
 
-import nibabel as nib
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logger = logging.getLogger(__name__)
 
-from src.label_lesions import label_lesions
-from src.quantifying_lesions import quantify_lesions
-
-DEFAULT_DATA_DIR = Path(__file__).parent / "data"
+sys.path.insert(0, str(Path(__file__).parent))
 
 
-def _parse_modality(s: str) -> tuple:
-    """Parse 'NAME=path/to/file.nii.gz' into (name, path)."""
-    if "=" not in s:
-        raise argparse.ArgumentTypeError(
-            f"Modality must be in NAME=PATH format, got: {s!r}"
-        )
-    name, path = s.split("=", 1)
-    return name.strip(), path.strip()
+def parse_args():
+    p = argparse.ArgumentParser(description="Quantify lesions from NIfTI segmentation.")
+    p.add_argument(
+        "--seg",
+        default="data/truenet.nii.gz",
+        help="Lesion segmentation / probability map (default: data/truenet.nii.gz)",
+    )
+    p.add_argument(
+        "--modalities",
+        nargs="+",
+        metavar="NAME=PATH",
+        default=["T1=data/T1.nii.gz", "T2=data/T2.nii.gz"],
+        help="Modality images as NAME=PATH pairs (default: T1 and T2 from data/)",
+    )
+    p.add_argument(
+        "--output",
+        default="lesion_measurements.csv",
+        help="Output CSV path (default: lesion_measurements.csv)",
+    )
+    p.add_argument(
+        "--threshold",
+        type=float,
+        default=0.3,
+        help="Binarization threshold for lesion labeling (default: 0.3)",
+    )
+    p.add_argument(
+        "--split-confluent",
+        action="store_true",
+        help="Attempt to split confluent lesions via iterative erosion",
+    )
+    p.add_argument("--nawm-mask", help="NAWM binary mask NIfTI path")
+    p.add_argument("--jacobian-map", help="Jacobian determinant map NIfTI path")
+    p.add_argument(
+        "--prob-map",
+        help="Probabilistic segmentation map (if different from --seg)",
+    )
+    p.add_argument(
+        "--n-shells",
+        type=int,
+        default=5,
+        help="Number of concentric shells for radial profiles (default: 5)",
+    )
+    p.add_argument(
+        "--no-radiomics",
+        action="store_true",
+        help="Skip PyRadiomics texture features",
+    )
+    p.add_argument(
+        "--wavelet",
+        action="store_true",
+        help="Include wavelet filter bank in PyRadiomics (slow)",
+    )
+    p.add_argument(
+        "--log",
+        action="store_true",
+        help="Include LoG filter bank in PyRadiomics (slow)",
+    )
+    return p.parse_args()
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="LesionOmics: end-to-end lesion feature extraction pipeline",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
-    )
-    parser.add_argument(
-        "--prob-map", default=None,
-        help="Lesion probability map NIfTI (default: data/truenet.nii.gz)",
-    )
-    parser.add_argument(
-        "--modalities", nargs="+", type=_parse_modality, metavar="NAME=PATH",
-        help="Co-registered modality images. "
-             "Default: T1=data/T1.nii.gz T2=data/T2.nii.gz",
-    )
-    parser.add_argument(
-        "--output", default="lesion_measurements.csv",
-        help="Output CSV path (default: lesion_measurements.csv)",
-    )
-    parser.add_argument(
-        "--threshold", type=float, default=0.3,
-        help="Binarisation threshold for probability map (default: 0.3)",
-    )
-    parser.add_argument(
-        "--split-confluent", action="store_true",
-        help="Apply erosion-based confluent lesion splitting before quantification",
-    )
-    parser.add_argument(
-        "--nawm-mask", default=None,
-        help="Binary NAWM mask NIfTI for NAWM-normalised intensity columns",
-    )
-    parser.add_argument(
-        "--jacobian-map", default=None,
-        help="Jacobian determinant NIfTI (from compute_lesion_jacobian_pipeline) "
-             "for per-lesion expansion/contraction statistics",
-    )
-    parser.add_argument(
-        "--n-shells", type=int, default=5,
-        help="Number of concentric erosion shells for radial intensity profiling (default: 5)",
-    )
-    parser.add_argument(
-        "--no-radiomics", action="store_true",
-        help="Skip PyRadiomics texture features (faster; use when pyradiomics "
-             "is not installed)",
-    )
-    parser.add_argument(
-        "--wavelet", action="store_true",
-        help="Enable PyRadiomics wavelet filter-bank features (significantly slower)",
-    )
-    parser.add_argument(
-        "--log", action="store_true",
-        help="Enable PyRadiomics LoG filter-bank features at sigma 1/2/3 mm (slower)",
-    )
-    args = parser.parse_args()
+    import nibabel as nib
+    from src.label_lesions import label_lesions
+    from src.quantifying_lesions import quantify_lesions
 
-    # ── Resolve inputs ──────────────────────────────────────────────────
-    prob_path = (
-        Path(args.prob_map) if args.prob_map
-        else DEFAULT_DATA_DIR / "truenet.nii.gz"
-    )
-    if not prob_path.exists():
-        sys.exit(f"Error: probability map not found: {prob_path}")
+    args = parse_args()
 
-    if args.modalities:
-        modality_paths = dict(args.modalities)
-    else:
-        modality_paths = {
-            "T1": str(DEFAULT_DATA_DIR / "T1.nii.gz"),
-            "T2": str(DEFAULT_DATA_DIR / "T2.nii.gz"),
-        }
+    # --- Load segmentation and label lesions --------------------------------
+    seg_path = Path(args.seg)
+    if not seg_path.exists():
+        logger.error("Segmentation file not found: %s", seg_path)
+        sys.exit(1)
 
-    print("=" * 60)
-    print("LesionOmics Pipeline")
-    print("=" * 60)
-    print(f"  Probability map : {prob_path}")
-    for name, path in modality_paths.items():
-        print(f"  Modality {name:<8}: {path}")
-    print(f"  Threshold       : {args.threshold}")
-    print(f"  Split confluent : {args.split_confluent}")
-    print(f"  Shells          : {args.n_shells}")
-    print(f"  Radiomics       : {not args.no_radiomics}")
-    print(f"  Wavelet         : {args.wavelet}")
-    print(f"  LoG             : {args.log}")
-    print(f"  Output          : {args.output}")
-    print()
+    logger.info("Loading segmentation: %s", seg_path)
+    seg_img = nib.load(seg_path)
 
-    # ── Load images ──────────────────────────────────────────────────
-    print("[1/3] Loading images...")
-    prob_img = nib.load(str(prob_path))
+    logger.info("Labeling lesions (threshold=%.2f, split_confluent=%s)", args.threshold, args.split_confluent)
+    labeled_img = label_lesions(seg_img, threshold=args.threshold, split_confluent=args.split_confluent)
 
+    import numpy as np
+    n_lesions = int(labeled_img.get_fdata().max())
+    logger.info("Found %d lesion(s)", n_lesions)
+    if n_lesions == 0:
+        logger.warning("No lesions found. Check threshold or input file.")
+        sys.exit(0)
+
+    # --- Load modalities ----------------------------------------------------
     modalities = {}
-    for name, path in modality_paths.items():
+    for item in args.modalities:
+        if "=" not in item:
+            logger.error("Modality must be NAME=PATH, got: %s", item)
+            sys.exit(1)
+        name, path = item.split("=", 1)
         p = Path(path)
         if not p.exists():
-            sys.exit(f"Error: modality image not found: {p}")
-        modalities[name] = nib.load(str(p))
-        print(f"      Loaded {name} from {p}")
+            logger.warning("Modality file not found, skipping: %s", p)
+            continue
+        logger.info("Loading modality %s: %s", name, p)
+        modalities[name] = nib.load(p)
 
+    if not modalities:
+        logger.error("No valid modality images found.")
+        sys.exit(1)
+
+    # --- Optional maps ------------------------------------------------------
     nawm_mask = None
     if args.nawm_mask:
-        nawm_path = Path(args.nawm_mask)
-        if not nawm_path.exists():
-            sys.exit(f"Error: NAWM mask not found: {nawm_path}")
-        nawm_mask = nib.load(str(nawm_path))
-        print(f"      Loaded NAWM mask from {nawm_path}")
+        p = Path(args.nawm_mask)
+        if p.exists():
+            logger.info("Loading NAWM mask: %s", p)
+            nawm_mask = nib.load(p)
+        else:
+            logger.warning("NAWM mask not found: %s", p)
 
     jacobian_map = None
     if args.jacobian_map:
-        jac_path = Path(args.jacobian_map)
-        if not jac_path.exists():
-            sys.exit(f"Error: Jacobian map not found: {jac_path}")
-        jacobian_map = nib.load(str(jac_path))
-        print(f"      Loaded Jacobian map from {jac_path}")
+        p = Path(args.jacobian_map)
+        if p.exists():
+            logger.info("Loading Jacobian map: %s", p)
+            jacobian_map = nib.load(p)
+        else:
+            logger.warning("Jacobian map not found: %s", p)
 
-    # ── Step 1: Label lesions ───────────────────────────────────────────
-    print(f"\n[2/3] Labelling lesions "
-          f"(threshold={args.threshold}, "
-          f"split_confluent={args.split_confluent})...")
-    t0 = time.perf_counter()
-    labeled_img = label_lesions(
-        prob_img,
-        threshold=args.threshold,
-        split_confluent=args.split_confluent,
-    )
-    n_lesions = int(labeled_img.get_fdata().max())
-    print(f"      Found {n_lesions} lesion(s)  [{time.perf_counter() - t0:.1f}s]")
+    prob_map = None
+    if args.prob_map:
+        p = Path(args.prob_map)
+        if p.exists():
+            logger.info("Loading probability map: %s", p)
+            prob_map = nib.load(p)
+        else:
+            logger.warning("Probability map not found: %s", p)
 
-    if n_lesions == 0:
-        sys.exit(
-            "No lesions found above threshold. "
-            "Try lowering --threshold and re-run."
-        )
-
-    # ── Step 2: Quantify ───────────────────────────────────────────────
-    print(f"\n[3/3] Quantifying {n_lesions} lesion(s)...")
-    t0 = time.perf_counter()
+    # --- Quantify -----------------------------------------------------------
+    logger.info("Quantifying lesions (n_shells=%d, radiomics=%s) ...", args.n_shells, not args.no_radiomics)
     df = quantify_lesions(
         labeled_img=labeled_img,
         modalities=modalities,
-        prob_map=prob_img,
+        prob_map=prob_map,
         nawm_mask=nawm_mask,
         jacobian_map=jacobian_map,
         include_radiomics=not args.no_radiomics,
@@ -185,39 +181,14 @@ def main():
         include_log=args.log,
         n_shells=args.n_shells,
     )
-    elapsed = time.perf_counter() - t0
-    print(f"      Done  [{elapsed:.1f}s]")
 
-    # ── Save ─────────────────────────────────────────────────────────
-    df.to_csv(args.output, index=False)
+    # --- Save ---------------------------------------------------------------
+    out_path = Path(args.output)
+    df.to_csv(out_path, index=False)
+    logger.info("Saved %d lesions × %d features to %s", len(df), len(df.columns), out_path)
 
-    print()
-    print("=" * 60)
-    print(f"Results: {len(df)} lesions x {len(df.columns)} features")
-    print(f"Saved  : {args.output}")
-    print("=" * 60)
-    print()
-
-    print("Volume summary (mm³):")
-    vol = df["volume_mm3"]
-    print(f"  count : {len(vol)}")
-    print(f"  min   : {vol.min():.1f}")
-    print(f"  median: {vol.median():.1f}")
-    print(f"  mean  : {vol.mean():.1f}")
-    print(f"  max   : {vol.max():.1f}")
-    print()
-
-    print("Top 5 lesions by volume:")
-    cols = ["label", "volume_mm3", "sphericity", "hemisphere"]
-    if "mean_confidence" in df.columns:
-        cols.append("mean_confidence")
-    if "jacobian_mean" in df.columns:
-        cols.append("jacobian_mean")
-    top = df.nlargest(min(5, len(df)), "volume_mm3")[cols]
-    print(top.to_string(index=False))
-    print()
-
-    return df
+    # Print summary to stdout
+    print(df.to_string(max_cols=10, max_rows=20))
 
 
 if __name__ == "__main__":

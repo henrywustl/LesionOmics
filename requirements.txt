@@ -7,6 +7,12 @@ SimpleITK>=2.3
 trimesh>=3.21
 pytest>=7.0
 
+# Transitive dependencies required by torch / deepbet when present in the environment
+tqdm
+filelock
+fsspec>=0.8.5
+jinja2
+
 # Optional — install for texture features:
 # pyradiomics>=3.1
 

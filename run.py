@@ -21,7 +21,6 @@ import time
 from pathlib import Path
 
 import nibabel as nib
-import numpy as np
 
 from src.label_lesions import label_lesions
 from src.quantifying_lesions import quantify_lesions
@@ -71,9 +70,26 @@ def main():
         help="Binary NAWM mask NIfTI for NAWM-normalised intensity columns",
     )
     parser.add_argument(
+        "--jacobian-map", default=None,
+        help="Jacobian determinant NIfTI (from compute_lesion_jacobian_pipeline) "
+             "for per-lesion expansion/contraction statistics",
+    )
+    parser.add_argument(
+        "--n-shells", type=int, default=5,
+        help="Number of concentric erosion shells for radial intensity profiling (default: 5)",
+    )
+    parser.add_argument(
         "--no-radiomics", action="store_true",
         help="Skip PyRadiomics texture features (faster; use when pyradiomics "
              "is not installed)",
+    )
+    parser.add_argument(
+        "--wavelet", action="store_true",
+        help="Enable PyRadiomics wavelet filter-bank features (significantly slower)",
+    )
+    parser.add_argument(
+        "--log", action="store_true",
+        help="Enable PyRadiomics LoG filter-bank features at sigma 1/2/3 mm (slower)",
     )
     args = parser.parse_args()
 
@@ -101,11 +117,14 @@ def main():
         print(f"  Modality {name:<8}: {path}")
     print(f"  Threshold       : {args.threshold}")
     print(f"  Split confluent : {args.split_confluent}")
+    print(f"  Shells          : {args.n_shells}")
     print(f"  Radiomics       : {not args.no_radiomics}")
+    print(f"  Wavelet         : {args.wavelet}")
+    print(f"  LoG             : {args.log}")
     print(f"  Output          : {args.output}")
     print()
 
-    # ── Load images ────────────────────────────────────────────────────
+    # ── Load images ──────────────────────────────────────────────────
     print("[1/3] Loading images...")
     prob_img = nib.load(str(prob_path))
 
@@ -125,7 +144,15 @@ def main():
         nawm_mask = nib.load(str(nawm_path))
         print(f"      Loaded NAWM mask from {nawm_path}")
 
-    # ── Step 1: Label lesions ────────────────────────────────────────────
+    jacobian_map = None
+    if args.jacobian_map:
+        jac_path = Path(args.jacobian_map)
+        if not jac_path.exists():
+            sys.exit(f"Error: Jacobian map not found: {jac_path}")
+        jacobian_map = nib.load(str(jac_path))
+        print(f"      Loaded Jacobian map from {jac_path}")
+
+    # ── Step 1: Label lesions ───────────────────────────────────────────
     print(f"\n[2/3] Labelling lesions "
           f"(threshold={args.threshold}, "
           f"split_confluent={args.split_confluent})...")
@@ -144,7 +171,7 @@ def main():
             "Try lowering --threshold and re-run."
         )
 
-    # ── Step 2: Quantify ────────────────────────────────────────────────
+    # ── Step 2: Quantify ───────────────────────────────────────────────
     print(f"\n[3/3] Quantifying {n_lesions} lesion(s)...")
     t0 = time.perf_counter()
     df = quantify_lesions(
@@ -152,12 +179,16 @@ def main():
         modalities=modalities,
         prob_map=prob_img,
         nawm_mask=nawm_mask,
+        jacobian_map=jacobian_map,
         include_radiomics=not args.no_radiomics,
+        include_wavelet=args.wavelet,
+        include_log=args.log,
+        n_shells=args.n_shells,
     )
     elapsed = time.perf_counter() - t0
     print(f"      Done  [{elapsed:.1f}s]")
 
-    # ── Save ───────────────────────────────────────────────────────────
+    # ── Save ─────────────────────────────────────────────────────────
     df.to_csv(args.output, index=False)
 
     print()
@@ -167,7 +198,6 @@ def main():
     print("=" * 60)
     print()
 
-    # Volume summary
     print("Volume summary (mm³):")
     vol = df["volume_mm3"]
     print(f"  count : {len(vol)}")
@@ -177,12 +207,13 @@ def main():
     print(f"  max   : {vol.max():.1f}")
     print()
 
-    # Top 5 by volume
     print("Top 5 lesions by volume:")
-    top = df.nlargest(min(5, len(df)), "volume_mm3")[
-        ["label", "volume_mm3", "sphericity", "hemisphere"]
-        + (["mean_confidence"] if "mean_confidence" in df.columns else [])
-    ]
+    cols = ["label", "volume_mm3", "sphericity", "hemisphere"]
+    if "mean_confidence" in df.columns:
+        cols.append("mean_confidence")
+    if "jacobian_mean" in df.columns:
+        cols.append("jacobian_mean")
+    top = df.nlargest(min(5, len(df)), "volume_mm3")[cols]
     print(top.to_string(index=False))
     print()
 

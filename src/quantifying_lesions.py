@@ -30,6 +30,12 @@ except ImportError:
         stacklevel=2,
     )
 
+try:
+    import trimesh as _trimesh
+    _TRIMESH_AVAILABLE = True
+except ImportError:
+    _TRIMESH_AVAILABLE = False
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -58,6 +64,38 @@ def _surface_area_mm2(mask: np.ndarray, voxel_sizes: tuple) -> float:
         return float(mesh_surface_area(verts, faces))
     except Exception:
         return np.nan
+
+
+def _surface_curvature_stats(mask: np.ndarray, voxel_sizes: tuple) -> dict:
+    """
+    Discrete mean curvature statistics on the lesion surface mesh.
+
+    Requires trimesh (pip install trimesh).  Returns NaN columns when
+    trimesh is unavailable or the mesh is degenerate.
+
+    Returns keys: curvature_mean, curvature_std, curvature_abs_max
+    """
+    nan_row = {"curvature_mean": np.nan, "curvature_std": np.nan, "curvature_abs_max": np.nan}
+    if not _TRIMESH_AVAILABLE:
+        return nan_row
+    try:
+        verts, faces, _, _ = marching_cubes(
+            mask.astype(np.float32), level=0.5, spacing=voxel_sizes
+        )
+        mesh = _trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+        radius = float(max(voxel_sizes)) * 2.0
+        H = _trimesh.curvature.discrete_mean_curvature_measure(
+            mesh, mesh.vertices, radius=radius
+        )
+        # Normalise by integration ball area to get curvature per mm²
+        H_norm = H / (np.pi * radius ** 2)
+        return {
+            "curvature_mean":    float(np.mean(H_norm)),
+            "curvature_std":     float(np.std(H_norm)),
+            "curvature_abs_max": float(np.max(np.abs(H_norm))),
+        }
+    except Exception:
+        return nan_row
 
 
 def _compute_4d_inertia(coords: np.ndarray, intensities: np.ndarray):
@@ -135,8 +173,138 @@ def _boundary_gradient_stats(data: np.ndarray, mask: np.ndarray, prefix: str) ->
     }
 
 
-def _build_radiomics_extractor():
-    """Instantiate a PyRadiomics extractor with texture feature classes enabled."""
+def _perilesional_ring_stats(
+    data: np.ndarray, mask: np.ndarray, prefix: str, n_dilations: int = 3
+) -> dict:
+    """
+    Intensity statistics in the perilesional tissue ring surrounding the lesion.
+
+    Dilates the mask n_dilations times and computes stats on the band of voxels
+    that are in the dilated mask but not in the original lesion mask.  Captures
+    peri-lesional oedema and tissue reaction distinct from global NAWM.
+
+    Returns: {prefix}_perilesional_mean/std and {prefix}_lesion_perilesional_ratio.
+    """
+    dilated = ndimage.binary_dilation(mask, iterations=n_dilations)
+    ring = dilated & ~mask
+    ring_vals = data[ring]
+    lesion_vals = data[mask]
+
+    if ring_vals.size == 0 or lesion_vals.size == 0:
+        return {
+            f"{prefix}_perilesional_mean":           np.nan,
+            f"{prefix}_perilesional_std":            np.nan,
+            f"{prefix}_lesion_perilesional_ratio":   np.nan,
+        }
+
+    ring_mean   = float(np.mean(ring_vals))
+    lesion_mean = float(np.mean(lesion_vals))
+    return {
+        f"{prefix}_perilesional_mean":         ring_mean,
+        f"{prefix}_perilesional_std":          float(np.std(ring_vals)),
+        f"{prefix}_lesion_perilesional_ratio": lesion_mean / ring_mean if ring_mean != 0 else np.nan,
+    }
+
+
+def _concentric_shell_stats(
+    data: np.ndarray, mask: np.ndarray, prefix: str, n_shells: int = 5
+) -> dict:
+    """
+    Intensity statistics in concentric erosion shells from surface inward.
+
+    Shell 0 is the outermost 1-voxel layer; shell n_shells-1 is the core.
+    Captures the radial intensity profile that distinguishes rim-active
+    from diffuse lesions.  Also computes a linear slope across shells
+    (negative slope = brighter at the rim than core).
+
+    Returns per-shell mean/std/n_vox, rim_core_ratio, and shell_gradient_slope/r2.
+    """
+    results: dict = {}
+    shell_means: list = []
+
+    current = mask.copy()
+    for i in range(n_shells - 1):
+        eroded = ndimage.binary_erosion(current)
+        if eroded.sum() == 0:
+            # Remaining mass becomes the final shell; fill rest with NaN
+            shell = current
+            vals = data[shell]
+            results[f"{prefix}_shell_{i}_mean"]  = float(np.mean(vals)) if vals.size else np.nan
+            results[f"{prefix}_shell_{i}_std"]   = float(np.std(vals))  if vals.size else np.nan
+            results[f"{prefix}_shell_{i}_n_vox"] = int(vals.size)
+            if vals.size:
+                shell_means.append(float(np.mean(vals)))
+            for j in range(i + 1, n_shells):
+                results[f"{prefix}_shell_{j}_mean"]  = np.nan
+                results[f"{prefix}_shell_{j}_std"]   = np.nan
+                results[f"{prefix}_shell_{j}_n_vox"] = 0
+            break
+        shell = current & ~eroded
+        vals = data[shell]
+        results[f"{prefix}_shell_{i}_mean"]  = float(np.mean(vals)) if vals.size else np.nan
+        results[f"{prefix}_shell_{i}_std"]   = float(np.std(vals))  if vals.size else np.nan
+        results[f"{prefix}_shell_{i}_n_vox"] = int(vals.size)
+        if vals.size:
+            shell_means.append(float(np.mean(vals)))
+        current = eroded
+    else:
+        # Core shell (innermost)
+        vals = data[current]
+        results[f"{prefix}_shell_{n_shells - 1}_mean"]  = float(np.mean(vals)) if vals.size else np.nan
+        results[f"{prefix}_shell_{n_shells - 1}_std"]   = float(np.std(vals))  if vals.size else np.nan
+        results[f"{prefix}_shell_{n_shells - 1}_n_vox"] = int(vals.size)
+        if vals.size:
+            shell_means.append(float(np.mean(vals)))
+
+    # Rim-to-core ratio (shell_0 / deepest valid shell)
+    core_mean = results.get(f"{prefix}_shell_{min(n_shells - 1, len(shell_means) - 1)}_mean", np.nan)
+    rim_mean  = results.get(f"{prefix}_shell_0_mean", np.nan)
+    results[f"{prefix}_rim_core_ratio"] = (
+        rim_mean / core_mean
+        if not (np.isnan(rim_mean) or np.isnan(core_mean) or core_mean == 0)
+        else np.nan
+    )
+
+    # Linear slope from surface (i=0) inward: negative = higher at rim
+    if len(shell_means) >= 2:
+        xs = np.arange(len(shell_means), dtype=float)
+        slope, _, r, _, _ = stats.linregress(xs, shell_means)
+        results[f"{prefix}_shell_gradient_slope"] = float(slope)
+        results[f"{prefix}_shell_gradient_r2"]    = float(r ** 2)
+    else:
+        results[f"{prefix}_shell_gradient_slope"] = np.nan
+        results[f"{prefix}_shell_gradient_r2"]    = np.nan
+
+    return results
+
+
+def _mutual_information(v1: np.ndarray, v2: np.ndarray, n_bins: int = 32) -> float:
+    """
+    Histogram-based mutual information between two intensity arrays.
+
+    Complements Pearson correlation by capturing non-linear co-dependence.
+    Pure numpy — no sklearn required.
+    """
+    if v1.size < 4:
+        return np.nan
+    try:
+        hist_2d, _, _ = np.histogram2d(v1, v2, bins=n_bins)
+        pxy = hist_2d / (hist_2d.sum() + 1e-12)
+        px  = pxy.sum(axis=1, keepdims=True)
+        py  = pxy.sum(axis=0, keepdims=True)
+        px_py = px * py
+        nonzero = pxy > 0
+        mi = float(np.sum(pxy[nonzero] * np.log(pxy[nonzero] / (px_py[nonzero] + 1e-12))))
+        return max(mi, 0.0)  # numerical noise can produce tiny negatives
+    except Exception:
+        return np.nan
+
+
+def _build_radiomics_extractor(
+    include_wavelet: bool = False,
+    include_log: bool = False,
+):
+    """Instantiate a PyRadiomics extractor with texture (and optionally filter-bank) features."""
     import logging
     logging.getLogger("radiomics").setLevel(logging.ERROR)
     from radiomics import featureextractor
@@ -146,6 +314,10 @@ def _build_radiomics_extractor():
     ex.disableAllFeatures()
     for cls in ("glcm", "glrlm", "glszm", "ngtdm"):
         ex.enableFeatureClassByName(cls)
+    if include_wavelet:
+        ex.enableImageTypeByName("Wavelet")
+    if include_log:
+        ex.enableImageTypeByName("LoG", customArgs={"sigma": [1.0, 2.0, 3.0]})
     return ex
 
 
@@ -198,7 +370,11 @@ def quantify_lesions(
     modalities: dict,
     prob_map: nib.Nifti1Image = None,
     nawm_mask: nib.Nifti1Image = None,
+    jacobian_map: nib.Nifti1Image = None,
     include_radiomics: bool = True,
+    include_wavelet: bool = False,
+    include_log: bool = False,
+    n_shells: int = 5,
 ) -> pd.DataFrame:
     """
     Compute per-lesion features from a labeled NIfTI segmentation.
@@ -212,20 +388,25 @@ def quantify_lesions(
                            Enables fuzzy/confidence feature columns.
         nawm_mask:         Optional binary NAWM mask NIfTI.  Enables NAWM-
                            normalised intensity columns per modality.
-        include_radiomics: Whether to extract PyRadiomics texture features.
-                           Requires pyradiomics to be installed.
+        jacobian_map:      Optional Jacobian determinant NIfTI (from
+                           jacobian_determinant.compute_lesion_jacobian_pipeline).
+                           Enables per-lesion expansion/contraction statistics.
+        include_radiomics: Whether to run PyRadiomics texture extraction.
+        include_wavelet:   Enable PyRadiomics wavelet filter bank (slow).
+        include_log:       Enable PyRadiomics LoG filter bank at sigma 1/2/3 mm (slow).
+        n_shells:          Number of concentric erosion shells (default 5).
 
     Returns:
         pd.DataFrame with one row per lesion.
     """
     labeled_data = labeled_img.get_fdata()
-    affine = labeled_img.affine
-    header = labeled_img.header
-    voxel_vol = voxel_volume_from_header(header)
-    voxel_sizes = tuple(float(z) for z in header.get_zooms()[:3])
+    affine       = labeled_img.affine
+    header       = labeled_img.header
+    voxel_vol    = voxel_volume_from_header(header)
+    voxel_sizes  = tuple(float(z) for z in header.get_zooms()[:3])
 
     mod_arrays = {name: img.get_fdata() for name, img in modalities.items()}
-    mod_names = list(mod_arrays.keys())
+    mod_names  = list(mod_arrays.keys())
 
     # NAWM reference statistics per modality
     nawm_stats: dict = {}
@@ -235,35 +416,42 @@ def quantify_lesions(
             w = arr[nawm_bin]
             nawm_stats[name] = (float(np.mean(w)), float(np.std(w)))
 
-    prob_data = prob_map.get_fdata() if prob_map is not None else None
+    prob_data     = prob_map.get_fdata()    if prob_map     is not None else None
+    jacobian_data = jacobian_map.get_fdata() if jacobian_map is not None else None
 
     all_labels = np.unique(labeled_data)
     all_labels = all_labels[all_labels != 0]
 
-    # Precompute centroids once for inter-lesion distance
+    # Precompute centroids in both voxel and mm space
     centroids: dict = {
         lv: ndimage.center_of_mass(labeled_data == lv) for lv in all_labels
+    }
+    centroids_mm: dict = {
+        lv: nib.affines.apply_affine(affine, np.array(c))
+        for lv, c in centroids.items()
     }
 
     extractor = None
     if include_radiomics and _RADIOMICS_AVAILABLE:
-        extractor = _build_radiomics_extractor()
+        extractor = _build_radiomics_extractor(
+            include_wavelet=include_wavelet, include_log=include_log
+        )
 
     results = []
     for label_val in all_labels:
-        mask = labeled_data == label_val
-        coords = np.argwhere(mask)  # (N, 3) voxel indices
+        mask   = labeled_data == label_val
+        coords = np.argwhere(mask)       # (N, 3) voxel indices
         row: dict = {"label": int(label_val)}
 
-        # ── Volume ──────────────────────────────────────────────────────────
-        n_vox = int(coords.shape[0])
+        # ── Volume ─────────────────────────────────────────────────────────
+        n_vox   = int(coords.shape[0])
         vol_mm3 = n_vox * voxel_vol
         row["volume_vox"] = n_vox
         row["volume_mm3"] = vol_mm3
 
         # ── Centre of mass ──────────────────────────────────────────────────
         com_vox = centroids[label_val]
-        com_mm = nib.affines.apply_affine(affine, np.array(com_vox))
+        com_mm  = centroids_mm[label_val]
         row.update({
             "com_x_vox": com_vox[0], "com_y_vox": com_vox[1], "com_z_vox": com_vox[2],
             "com_x_mm":  float(com_mm[0]),
@@ -276,7 +464,7 @@ def quantify_lesions(
         rp = regionprops(mask.astype(np.int32))[0]
         bb = rp.bbox  # (min0, min1, min2, max0, max1, max2)
         bb_dims = (bb[3] - bb[0], bb[4] - bb[1], bb[5] - bb[2])
-        bb_vol = int(bb_dims[0] * bb_dims[1] * bb_dims[2])
+        bb_vol  = int(bb_dims[0] * bb_dims[1] * bb_dims[2])
         row.update({
             "bbox_dim0_vox":   bb_dims[0],
             "bbox_dim1_vox":   bb_dims[1],
@@ -285,14 +473,14 @@ def quantify_lesions(
             "bbox_fill_ratio": n_vox / bb_vol if bb_vol > 0 else np.nan,
         })
 
-        # ── Convex hull ─────────────────────────────────────────────────────
+        # ── Convex hull ────────────────────────────────────────────────────
         ch_vol = _convex_hull_volume(coords)
         row["convex_hull_volume_vox"] = ch_vol
         row["convexness"] = (n_vox / ch_vol) if ch_vol > 0 else np.nan
 
-        # ── Surface area & sphericity ────────────────────────────────────────
+        # ── Surface area & sphericity ───────────────────────────────────────
         sa = _surface_area_mm2(mask, voxel_sizes)
-        row["surface_area_mm2"]    = sa
+        row["surface_area_mm2"]     = sa
         row["surface_volume_ratio"] = (
             sa / vol_mm3 if (not np.isnan(sa) and vol_mm3 > 0) else np.nan
         )
@@ -301,7 +489,10 @@ def quantify_lesions(
         else:
             row["sphericity"] = np.nan
 
-        # ── Inertia tensor & derived shape ratios ────────────────────────────
+        # ── Surface curvature (requires trimesh) ────────────────────────────
+        row.update(_surface_curvature_stats(mask, voxel_sizes))
+
+        # ── Inertia tensor & derived shape ratios ───────────────────────────
         eigvals_3d = np.sort(rp.inertia_tensor_eigvals)[::-1]  # λ1 ≥ λ2 ≥ λ3
         lam1, lam2, lam3 = eigvals_3d
         row.update({
@@ -313,18 +504,28 @@ def quantify_lesions(
             "isotropy":   float(lam3 / lam1)           if lam1 > 0 else np.nan,
         })
 
-        # ── Topology ─────────────────────────────────────────────────────────
+        # ── Topology ────────────────────────────────────────────────────────
         row["euler_number"] = int(euler_number(mask, connectivity=3))
 
-        # ── Inter-lesion distance ─────────────────────────────────────────────
-        others = [c for lv, c in centroids.items() if lv != label_val]
-        if others:
-            dists = [
-                np.linalg.norm(np.array(com_vox) - np.array(c)) for c in others
-            ]
-            row["nearest_lesion_dist_vox"] = float(min(dists))
+        # ── Inter-lesion distances & neighbourhood density ─────────────────────
+        other_vox = [c for lv, c in centroids.items()    if lv != label_val]
+        other_mm  = [c for lv, c in centroids_mm.items() if lv != label_val]
+        if other_vox:
+            dists_vox = [np.linalg.norm(np.array(com_vox) - np.array(c)) for c in other_vox]
+            dists_mm  = [np.linalg.norm(com_mm - np.array(c))             for c in other_mm]
+            row["nearest_lesion_dist_vox"]      = float(min(dists_vox))
+            row["nearest_lesion_dist_mm"]       = float(min(dists_mm))
+            row["lesions_within_10mm"]          = int(sum(1 for d in dists_mm if d <= 10))
+            row["lesions_within_20mm"]          = int(sum(1 for d in dists_mm if d <= 20))
+            row["lesions_within_30mm"]          = int(sum(1 for d in dists_mm if d <= 30))
+            row["mean_dist_to_all_lesions_mm"]  = float(np.mean(dists_mm))
         else:
-            row["nearest_lesion_dist_vox"] = np.nan
+            row["nearest_lesion_dist_vox"]     = np.nan
+            row["nearest_lesion_dist_mm"]      = np.nan
+            row["lesions_within_10mm"]         = 0
+            row["lesions_within_20mm"]         = 0
+            row["lesions_within_30mm"]         = 0
+            row["mean_dist_to_all_lesions_mm"] = np.nan
 
         # ── 4D inertia (spatial + intensity) per modality ────────────────────
         for name, arr in mod_arrays.items():
@@ -336,18 +537,20 @@ def quantify_lesions(
                 for i in range(1, 5):
                     row[f"inertia_4d_{name}_eigval_{i}"] = np.nan
 
-        # ── Intensity statistics per modality ─────────────────────────────────
+        # ── Intensity statistics, gradient, perilesional ring & shells ────────
         for name, arr in mod_arrays.items():
             vals = arr[mask]
             row.update(_intensity_stats(vals, prefix=name))
             row.update(_boundary_gradient_stats(arr, mask, prefix=name))
+            row.update(_perilesional_ring_stats(arr, mask, prefix=name))
+            row.update(_concentric_shell_stats(arr, mask, prefix=name, n_shells=n_shells))
             if name in nawm_stats:
                 nm, ns = nawm_stats[name]
                 row[f"{name}_nawm_norm_mean"] = (
                     (float(np.mean(vals)) - nm) / ns if ns > 0 else np.nan
                 )
 
-        # ── Pairwise modality ratios & correlation ────────────────────────────
+        # ── Pairwise: ratio, Pearson correlation, mutual information ──────────
         for n1, n2 in combinations(mod_names, 2):
             v1 = mod_arrays[n1][mask]
             v2 = mod_arrays[n2][mask]
@@ -358,14 +561,27 @@ def quantify_lesions(
             row[f"{n1}_{n2}_correlation"] = (
                 float(np.corrcoef(v1, v2)[0, 1]) if v1.size > 1 else np.nan
             )
+            row[f"{n1}_{n2}_mutual_info"] = _mutual_information(v1, v2)
 
-        # ── PyRadiomics texture features ──────────────────────────────────────
+        # ── PyRadiomics texture features ─────────────────────────────────────
         for name, arr in mod_arrays.items():
             row.update(
                 _radiomics_features(mask, arr, header, prefix=name, extractor=extractor)
             )
 
-        # ── Probabilistic segmentation features ──────────────────────────────
+        # ── Jacobian determinant statistics ─────────────────────────────────
+        if jacobian_data is not None:
+            jac = jacobian_data[mask]
+            row.update({
+                "jacobian_mean":                 float(np.mean(jac)),
+                "jacobian_std":                  float(np.std(jac)),
+                "jacobian_median":               float(np.median(jac)),
+                # Jacobian > 1 → local expansion; < 1 → contraction
+                "jacobian_expanding_fraction":   float(np.mean(jac > 1.0)),
+                "jacobian_contracting_fraction": float(np.mean(jac < 1.0)),
+            })
+
+        # ── Probabilistic segmentation features ─────────────────────────────
         if prob_data is not None:
             probs = prob_data[mask]
             row.update({

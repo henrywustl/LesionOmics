@@ -93,8 +93,8 @@ class TestMatchLesionsLongitudinal:
         r = label_lesions(img, threshold=0.5)
         df = match_lesions_longitudinal(r, r)
         expected = [
-            "tp1_label", "tp1_blob_id", "tp1_sub_label", "tp1_display_id",
-            "tp2_label", "tp2_blob_id", "tp2_sub_label", "tp2_display_id",
+            "tp1_label", "tp1_confluent_lesion_id", "tp1_sub_label", "tp1_display_id",
+            "tp2_label", "tp2_confluent_lesion_id", "tp2_sub_label", "tp2_display_id",
             "overlap_vox", "iou", "match_type",
         ]
         for col in expected:

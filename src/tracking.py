@@ -37,8 +37,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _MATCH_COLS = [
-    "tp1_label", "tp1_blob_id", "tp1_sub_label", "tp1_display_id",
-    "tp2_label", "tp2_blob_id", "tp2_sub_label", "tp2_display_id",
+    "tp1_label", "tp1_confluent_lesion_id", "tp1_sub_label", "tp1_display_id",
+    "tp2_label", "tp2_confluent_lesion_id", "tp2_sub_label", "tp2_display_id",
     "overlap_vox", "iou", "match_type",
 ]
 
@@ -89,14 +89,15 @@ def match_lesions_longitudinal(
 
     Returns:
         DataFrame with columns:
-          tp1_label, tp1_blob_id, tp1_sub_label, tp1_display_id,
-          tp2_label, tp2_blob_id, tp2_sub_label, tp2_display_id,
+          tp1_label, tp1_confluent_lesion_id, tp1_sub_label, tp1_display_id,
+          tp2_label, tp2_confluent_lesion_id, tp2_sub_label, tp2_display_id,
           overlap_vox, iou, match_type
 
         match_type is one of: "stable", "split", "merge", "new", "resolved".
 
-        Classification is blob-aware: sub-lesions from the same blob are
-        treated as a unit when deciding whether a blob split or merged.
+        Classification is contiguous-lesion-aware: split sub-lesions from the
+        same contiguous lesion are treated as a unit when deciding whether a
+        contiguous lesion split or merged.
     """
     arr1 = result_tp1.label_img.get_fdata().astype(np.int32)
     arr2 = result_tp2.label_img.get_fdata().astype(np.int32)
@@ -124,18 +125,18 @@ def match_lesions_longitudinal(
     matched_tp2: set = set()
 
     if not ovlp.empty:
-        ovlp["blob_tp1"] = ovlp["label_tp1"].map(lambda l: _h(h1, int(l), "blob_id", int(l)))
-        ovlp["blob_tp2"] = ovlp["label_tp2"].map(lambda l: _h(h2, int(l), "blob_id", int(l)))
-        blob1_to_blobs2 = ovlp.groupby("blob_tp1")["blob_tp2"].apply(set).to_dict()
-        blob2_to_blobs1 = ovlp.groupby("blob_tp2")["blob_tp1"].apply(set).to_dict()
+        ovlp["cl_tp1"] = ovlp["label_tp1"].map(lambda l: _h(h1, int(l), "confluent_lesion_id", int(l)))
+        ovlp["cl_tp2"] = ovlp["label_tp2"].map(lambda l: _h(h2, int(l), "confluent_lesion_id", int(l)))
+        cl1_to_cls2 = ovlp.groupby("cl_tp1")["cl_tp2"].apply(set).to_dict()
+        cl2_to_cls1 = ovlp.groupby("cl_tp2")["cl_tp1"].apply(set).to_dict()
 
         for _, row in ovlp.iterrows():
             l1, l2 = int(row["label_tp1"]), int(row["label_tp2"])
-            b1, b2 = int(row["blob_tp1"]), int(row["blob_tp2"])
+            b1, b2 = int(row["cl_tp1"]), int(row["cl_tp2"])
             matched_tp1.add(l1)
             matched_tp2.add(l2)
-            n2 = len(blob1_to_blobs2.get(b1, set()))
-            n1 = len(blob2_to_blobs1.get(b2, set()))
+            n2 = len(cl1_to_cls2.get(b1, set()))
+            n1 = len(cl2_to_cls1.get(b2, set()))
             if n2 > 1 and n1 == 1:
                 match_type = "split"
             elif n1 > 1:
@@ -143,10 +144,12 @@ def match_lesions_longitudinal(
             else:
                 match_type = "stable"
             rows.append({
-                "tp1_label": l1, "tp1_blob_id": _h(h1, l1, "blob_id"),
+                "tp1_label": l1,
+                "tp1_confluent_lesion_id": _h(h1, l1, "confluent_lesion_id"),
                 "tp1_sub_label": _h(h1, l1, "sub_label"),
                 "tp1_display_id": _h(h1, l1, "display_id", f"L{l1}"),
-                "tp2_label": l2, "tp2_blob_id": _h(h2, l2, "blob_id"),
+                "tp2_label": l2,
+                "tp2_confluent_lesion_id": _h(h2, l2, "confluent_lesion_id"),
                 "tp2_sub_label": _h(h2, l2, "sub_label"),
                 "tp2_display_id": _h(h2, l2, "display_id", f"L{l2}"),
                 "overlap_vox": int(row["overlap_vox"]),
@@ -156,10 +159,11 @@ def match_lesions_longitudinal(
     for l1 in vol1:
         if l1 not in matched_tp1:
             rows.append({
-                "tp1_label": l1, "tp1_blob_id": _h(h1, l1, "blob_id"),
+                "tp1_label": l1,
+                "tp1_confluent_lesion_id": _h(h1, l1, "confluent_lesion_id"),
                 "tp1_sub_label": _h(h1, l1, "sub_label"),
                 "tp1_display_id": _h(h1, l1, "display_id", f"L{l1}"),
-                "tp2_label": None, "tp2_blob_id": None,
+                "tp2_label": None, "tp2_confluent_lesion_id": None,
                 "tp2_sub_label": None, "tp2_display_id": None,
                 "overlap_vox": 0, "iou": 0.0, "match_type": "resolved",
             })
@@ -167,9 +171,10 @@ def match_lesions_longitudinal(
     for l2 in vol2:
         if l2 not in matched_tp2:
             rows.append({
-                "tp1_label": None, "tp1_blob_id": None,
+                "tp1_label": None, "tp1_confluent_lesion_id": None,
                 "tp1_sub_label": None, "tp1_display_id": None,
-                "tp2_label": l2, "tp2_blob_id": _h(h2, l2, "blob_id"),
+                "tp2_label": l2,
+                "tp2_confluent_lesion_id": _h(h2, l2, "confluent_lesion_id"),
                 "tp2_sub_label": _h(h2, l2, "sub_label"),
                 "tp2_display_id": _h(h2, l2, "display_id", f"L{l2}"),
                 "overlap_vox": 0, "iou": 0.0, "match_type": "new",

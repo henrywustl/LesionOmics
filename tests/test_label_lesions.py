@@ -286,19 +286,19 @@ class TestLabeledResultHierarchy:
         result = label_lesions(_make_img(data))
         assert result.n_lesions == len(result.hierarchy)
 
-    def test_n_blobs_correct(self):
+    def test_n_confluent_lesions_correct(self):
         data = np.zeros((20, 10, 10), dtype=np.float32)
         data[1:4, 3:7, 3:7] = 1.0
         data[8:12, 3:7, 3:7] = 1.0
         result = label_lesions(_make_img(data))
-        assert result.n_blobs == 2
+        assert result.n_confluent_lesions == 2
 
-    def test_blob_img_has_same_affine(self):
+    def test_confluent_lesion_img_has_same_affine(self):
         affine = np.diag([2.0, 2.0, 2.0, 1.0])
         data = np.zeros((10, 10, 10), dtype=np.float32)
         data[2:5, 2:5, 2:5] = 1.0
         result = label_lesions(nib.Nifti1Image(data, affine))
-        np.testing.assert_array_equal(result.blob_img.affine, affine)
+        np.testing.assert_array_equal(result.confluent_lesion_img.affine, affine)
 
     def test_int_to_sublabel(self):
         from src.label_lesions import _int_to_sublabel

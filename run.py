@@ -122,15 +122,16 @@ def main():
         "Labeling lesions (threshold=%.2f, split_confluent=%s, split_method=%s)",
         args.threshold, args.split_confluent, args.split_method,
     )
-    labeled_img = label_lesions(
+    labeled_result = label_lesions(
         seg_img,
         threshold=args.threshold,
         split_confluent=args.split_confluent,
         split_method=args.split_method,
     )
+    labeled_img = labeled_result.label_img
 
     import numpy as np
-    n_lesions = int(labeled_img.get_fdata().max())
+    n_lesions = labeled_result.n_lesions
     logger.info("Found %d lesion(s)", n_lesions)
     if n_lesions == 0:
         logger.warning("No lesions found. Check threshold or input file.")
@@ -185,7 +186,7 @@ def main():
     # --- Quantify -----------------------------------------------------------
     logger.info("Quantifying lesions (n_shells=%d, radiomics=%s) ...", args.n_shells, not args.no_radiomics)
     df = quantify_lesions(
-        labeled_img=labeled_img,
+        labeled_img=labeled_result,
         modalities=modalities,
         prob_map=prob_map,
         nawm_mask=nawm_mask,

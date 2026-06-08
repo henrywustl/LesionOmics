@@ -8,6 +8,7 @@ from src.label_lesions import (
     watershed_confluent_lesion_splitting,
     random_walker_confluent_lesion_splitting,
     label_lesions,
+    LabeledResult,
 )
 
 
@@ -76,53 +77,54 @@ class TestLabelLesions:
         data = np.zeros((10, 10, 10), dtype=np.float32)
         data[2:5, 2:5, 2:5] = 1.0
         result = label_lesions(_make_img(data))
-        assert isinstance(result, nib.Nifti1Image)
+        assert isinstance(result, LabeledResult)
+        assert isinstance(result.label_img, nib.Nifti1Image)
 
     def test_above_threshold_labeled(self):
         data = np.zeros((10, 10, 10), dtype=np.float32)
         data[2:5, 2:5, 2:5] = 0.5  # above default threshold 0.3
         result = label_lesions(_make_img(data))
-        assert result.get_fdata().max() == 1
+        assert result.label_img.get_fdata().max() == 1
 
     def test_below_threshold_gives_background(self):
         data = np.zeros((10, 10, 10), dtype=np.float32)
         data[2:5, 2:5, 2:5] = 0.2  # below 0.3
         result = label_lesions(_make_img(data))
-        assert result.get_fdata().max() == 0
+        assert result.label_img.get_fdata().max() == 0
 
     def test_two_components_labeled(self):
         data = np.zeros((20, 10, 10), dtype=np.float32)
         data[0:4, 3:7, 3:7] = 1.0
         data[8:12, 3:7, 3:7] = 1.0
         result = label_lesions(_make_img(data))
-        assert result.get_fdata().max() == 2
+        assert result.label_img.get_fdata().max() == 2
 
     def test_custom_threshold(self):
         data = np.zeros((10, 10, 10), dtype=np.float32)
         data[2:5, 2:5, 2:5] = 0.5  # below custom threshold of 0.8
         result = label_lesions(_make_img(data), threshold=0.8)
-        assert result.get_fdata().max() == 0
+        assert result.label_img.get_fdata().max() == 0
 
     def test_preserves_affine(self):
         affine = np.diag([2.0, 2.0, 2.0, 1.0])
         data = np.zeros((10, 10, 10), dtype=np.float32)
         data[2:5, 2:5, 2:5] = 1.0
         result = label_lesions(nib.Nifti1Image(data, affine))
-        np.testing.assert_array_equal(result.affine, affine)
+        np.testing.assert_array_equal(result.label_img.affine, affine)
 
     def test_largest_lesion_labeled_first(self):
         data = np.zeros((30, 10, 10), dtype=np.float32)
         data[0:3, 3:7, 3:7] = 1.0   # smaller
         data[10:18, 3:7, 3:7] = 1.0  # larger
         result = label_lesions(_make_img(data))
-        labeled = result.get_fdata()
+        labeled = result.label_img.get_fdata()
         assert labeled[13, 4, 4] == 1  # large block → label 1
         assert labeled[1, 4, 4] == 2   # small block → label 2
 
     def test_empty_image_gives_all_zeros(self):
         data = np.zeros((10, 10, 10), dtype=np.float32)
         result = label_lesions(_make_img(data))
-        assert result.get_fdata().max() == 0
+        assert result.label_img.get_fdata().max() == 0
 
     def test_invalid_split_method_raises(self):
         data = np.zeros((10, 10, 10), dtype=np.float32)
@@ -135,7 +137,7 @@ class TestLabelLesions:
         data = np.zeros((10, 10, 10), dtype=np.float32)
         data[2:8, 2:8, 2:8] = 1.0
         result = label_lesions(_make_img(data), split_confluent=False, split_method="watershed")
-        assert result.get_fdata().max() >= 1  # no error raised
+        assert result.label_img.get_fdata().max() >= 1  # no error raised
 
 
 # ---------------------------------------------------------------------------
@@ -212,8 +214,8 @@ class TestWatershedSplitting:
         arr = _two_merged_spheres()
         data[arr > 0] = 1.0
         result = label_lesions(_make_img(data), split_confluent=True, split_method="watershed")
-        assert isinstance(result, nib.Nifti1Image)
-        assert result.get_fdata().max() >= 1
+        assert isinstance(result, LabeledResult)
+        assert result.label_img.get_fdata().max() >= 1
 
 
 class TestRandomWalkerSplitting:
@@ -246,5 +248,60 @@ class TestRandomWalkerSplitting:
         arr = _two_merged_spheres()
         data[arr > 0] = 1.0
         result = label_lesions(_make_img(data), split_confluent=True, split_method="random_walker")
-        assert isinstance(result, nib.Nifti1Image)
-        assert result.get_fdata().max() >= 1
+        assert isinstance(result, LabeledResult)
+        assert result.label_img.get_fdata().max() >= 1
+
+
+# ---------------------------------------------------------------------------
+# LabeledResult hierarchy tests
+# ---------------------------------------------------------------------------
+
+class TestLabeledResultHierarchy:
+    def test_isolated_lesion_has_no_sub_label(self):
+        data = np.zeros((20, 10, 10), dtype=np.float32)
+        data[1:4, 3:7, 3:7] = 1.0
+        result = label_lesions(_make_img(data))
+        assert result.hierarchy["sub_label"].iloc[0] is None
+
+    def test_display_id_isolated(self):
+        data = np.zeros((20, 10, 10), dtype=np.float32)
+        data[1:4, 3:7, 3:7] = 1.0
+        result = label_lesions(_make_img(data))
+        assert result.hierarchy["display_id"].iloc[0] == "L1"
+
+    def test_split_lesion_has_sub_labels(self):
+        # Two merged spheres that erosion can split
+        arr = _two_merged_spheres()
+        data = arr.astype(np.float32)
+        result = label_lesions(_make_img(data), threshold=0.5, split_confluent=True)
+        # If splitting produced >1 sub-lesion, sub_label should be set
+        if len(result.hierarchy) > 1:
+            sub_labels = result.hierarchy["sub_label"].dropna()
+            assert len(sub_labels) > 0
+
+    def test_n_lesions_matches_hierarchy(self):
+        data = np.zeros((20, 10, 10), dtype=np.float32)
+        data[1:4, 3:7, 3:7] = 1.0
+        data[8:12, 3:7, 3:7] = 1.0
+        result = label_lesions(_make_img(data))
+        assert result.n_lesions == len(result.hierarchy)
+
+    def test_n_blobs_correct(self):
+        data = np.zeros((20, 10, 10), dtype=np.float32)
+        data[1:4, 3:7, 3:7] = 1.0
+        data[8:12, 3:7, 3:7] = 1.0
+        result = label_lesions(_make_img(data))
+        assert result.n_blobs == 2
+
+    def test_blob_img_has_same_affine(self):
+        affine = np.diag([2.0, 2.0, 2.0, 1.0])
+        data = np.zeros((10, 10, 10), dtype=np.float32)
+        data[2:5, 2:5, 2:5] = 1.0
+        result = label_lesions(nib.Nifti1Image(data, affine))
+        np.testing.assert_array_equal(result.blob_img.affine, affine)
+
+    def test_int_to_sublabel(self):
+        from src.label_lesions import _int_to_sublabel
+        assert _int_to_sublabel(1) == "A"
+        assert _int_to_sublabel(26) == "Z"
+        assert _int_to_sublabel(27) == "AA"

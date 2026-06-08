@@ -4,6 +4,8 @@ Extracts morphological, intensity, texture, neighbourhood, probabilistic, and
 Jacobian features for every labeled lesion in a NIfTI image.
 """
 
+from __future__ import annotations
+from typing import Union
 import logging
 
 import numpy as np
@@ -305,7 +307,7 @@ def _radiomics_features(
 # ---------------------------------------------------------------------------
 
 def quantify_lesions(
-    labeled_img: nib.Nifti1Image,
+    labeled_img: Union[nib.Nifti1Image, "LabeledResult"],
     modalities: dict,
     prob_map: nib.Nifti1Image = None,
     nawm_mask: nib.Nifti1Image = None,
@@ -333,6 +335,12 @@ def quantify_lesions(
     Returns:
         DataFrame with one row per lesion and one column per feature.
     """
+    # Accept either a bare NIfTI or a LabeledResult
+    hierarchy: "pd.DataFrame | None" = None
+    if hasattr(labeled_img, "hierarchy"):
+        hierarchy = labeled_img.hierarchy
+        labeled_img = labeled_img.label_img
+
     labeled_data = labeled_img.get_fdata()
     header = labeled_img.header
     affine = labeled_img.affine
@@ -518,4 +526,7 @@ def quantify_lesions(
 
         results.append(r)
 
-    return pd.DataFrame(results)
+    df = pd.DataFrame(results)
+    if hierarchy is not None and not hierarchy.empty:
+        df = df.merge(hierarchy, on="label", how="left")
+    return df

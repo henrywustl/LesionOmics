@@ -129,23 +129,25 @@ def run_comparison(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     labeled_imgs = {}
+    labeled_results = {}
     dfs = {}
 
     for method in METHODS:
         logger.info("Running split_method='%s' ...", method)
-        labeled_img = label_lesions(
+        labeled_result = label_lesions(
             seg_img,
             threshold=threshold,
             split_confluent=True,
             split_method=method,
         )
-        labeled_imgs[method] = labeled_img
-        n = int(labeled_img.get_fdata().max())
+        labeled_results[method] = labeled_result
+        labeled_imgs[method] = labeled_result.label_img
+        n = labeled_result.n_lesions
         logger.info("  → %d lesion(s)", n)
 
         if do_quantify and n > 0:
             df = quantify_lesions(
-                labeled_img=labeled_img,
+                labeled_img=labeled_result,
                 modalities=modalities,
                 include_radiomics=False,
             )

@@ -1,8 +1,10 @@
 import logging
+from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
 import nibabel as nib
+import pandas as pd
 import skimage.measure
 from skimage.measure import label, regionprops
 from skimage.segmentation import watershed
@@ -12,6 +14,43 @@ from scipy.ndimage import binary_erosion, distance_transform_edt
 logger = logging.getLogger(__name__)
 
 SplitMethod = Literal["erosion", "watershed", "random_walker"]
+
+
+def _int_to_sublabel(n: int) -> str:
+    """1→'A', 2→'B', 26→'Z', 27→'AA', etc. (Excel-style column naming)."""
+    result = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        result = chr(65 + r) + result
+    return result
+
+
+@dataclass
+class LabeledResult:
+    """Hierarchical lesion labeling result from label_lesions().
+
+    Attributes:
+        label_img:  NIfTI with flat integer labels 1..N — one per distinct
+                    lesion or sub-lesion.  Safe to pass to any NIfTI tool.
+        blob_img:   NIfTI with blob labels 1..M — one per original
+                    pre-split connected component.
+        hierarchy:  DataFrame with columns:
+                      label      – integer label in label_img
+                      blob_id    – integer label in blob_img this came from
+                      sub_label  – None (isolated) or 'A'/'B'/… (sub-lesion)
+                      display_id – human-readable id e.g. 'L1' or 'L3B'
+    """
+    label_img: nib.Nifti1Image
+    blob_img: nib.Nifti1Image
+    hierarchy: "pd.DataFrame"
+
+    @property
+    def n_lesions(self) -> int:
+        return int(self.label_img.get_fdata().max())
+
+    @property
+    def n_blobs(self) -> int:
+        return int(self.blob_img.get_fdata().max())
 
 
 def relabel_from_largest_to_smallest(labeled_array: np.ndarray) -> np.ndarray:
@@ -231,7 +270,7 @@ def label_lesions(
     threshold: float = 0.3,
     split_confluent: bool = False,
     split_method: SplitMethod = "erosion",
-) -> nib.Nifti1Image:
+) -> "LabeledResult":
     """Label connected lesion components in a NIfTI image.
 
     Args:
@@ -249,23 +288,75 @@ def label_lesions(
               smooth, probabilistically placed boundaries.
 
     Returns:
-        NIfTI image with integer labels (0 = background, 1..N = lesions,
-        sorted largest-first).
+        :class:`LabeledResult` containing:
+        - ``label_img``: NIfTI with flat labels 1..N (one per lesion/sub-lesion)
+        - ``blob_img``: NIfTI with pre-split blob labels 1..M
+        - ``hierarchy``: DataFrame mapping labels to blobs and sub-labels
 
     Raises:
         ValueError: If ``split_method`` is not one of the recognised options.
     """
+    if split_confluent and split_method not in _SPLIT_METHODS:
+        raise ValueError(
+            f"Unknown split_method {split_method!r}. "
+            f"Choose from: {list(_SPLIT_METHODS)}"
+        )
+
     data = input_img.get_fdata()
     binary_mask = data > threshold
-    labeled = label(binary_mask, connectivity=3)
-    labeled = relabel_from_largest_to_smallest(labeled)
 
-    if split_confluent and np.any(labeled):
-        if split_method not in _SPLIT_METHODS:
-            raise ValueError(
-                f"Unknown split_method {split_method!r}. "
-                f"Choose from: {list(_SPLIT_METHODS)}"
-            )
-        labeled = _SPLIT_METHODS[split_method](labeled)
+    # Find original connected components (blobs), sorted largest-first
+    blob_array = label(binary_mask, connectivity=3)
+    blob_array = relabel_from_largest_to_smallest(blob_array).astype(np.int32)
+    n_blobs = int(blob_array.max())
 
-    return nib.Nifti1Image(labeled.astype(np.int32), input_img.affine, input_img.header)
+    blob_img = nib.Nifti1Image(blob_array, input_img.affine, input_img.header)
+
+    # Build flat label array and hierarchy
+    label_array = np.zeros_like(blob_array, dtype=np.int32)
+    hierarchy_rows = []
+    next_label = 1
+
+    for blob_id in range(1, n_blobs + 1):
+        blob_mask = blob_array == blob_id
+        blob_only = np.where(blob_mask, 1, 0).astype(np.int32)
+
+        if split_confluent:
+            split_result = _SPLIT_METHODS[split_method](blob_only)
+        else:
+            split_result = blob_only
+
+        n_sub = int(split_result.max())
+
+        if n_sub <= 1:
+            # No split — isolated lesion
+            label_array[blob_mask] = next_label
+            hierarchy_rows.append({
+                "label": next_label,
+                "blob_id": blob_id,
+                "sub_label": None,
+                "display_id": f"L{blob_id}",
+            })
+            next_label += 1
+        else:
+            # Blob split into n_sub sub-lesions
+            # Relabel split_result by size (largest sub-lesion first → sub_label A)
+            split_result = relabel_from_largest_to_smallest(split_result)
+            for sub_idx in range(1, n_sub + 1):
+                sub_mask = split_result == sub_idx
+                label_array[sub_mask] = next_label
+                sl = _int_to_sublabel(sub_idx)
+                hierarchy_rows.append({
+                    "label": next_label,
+                    "blob_id": blob_id,
+                    "sub_label": sl,
+                    "display_id": f"L{blob_id}{sl}",
+                })
+                next_label += 1
+
+    label_img = nib.Nifti1Image(label_array, input_img.affine, input_img.header)
+    hierarchy = pd.DataFrame(hierarchy_rows) if hierarchy_rows else pd.DataFrame(
+        columns=["label", "blob_id", "sub_label", "display_id"]
+    )
+
+    return LabeledResult(label_img=label_img, blob_img=blob_img, hierarchy=hierarchy)

@@ -64,7 +64,13 @@ def parse_args():
     p.add_argument(
         "--split-confluent",
         action="store_true",
-        help="Attempt to split confluent lesions via iterative erosion",
+        help="Attempt to split confluent lesions",
+    )
+    p.add_argument(
+        "--split-method",
+        choices=["erosion", "watershed", "random_walker"],
+        default="erosion",
+        help="Algorithm used when --split-confluent is set (default: erosion)",
     )
     p.add_argument("--nawm-mask", help="NAWM binary mask NIfTI path")
     p.add_argument("--jacobian-map", help="Jacobian determinant map NIfTI path")
@@ -112,11 +118,20 @@ def main():
     logger.info("Loading segmentation: %s", seg_path)
     seg_img = nib.load(seg_path)
 
-    logger.info("Labeling lesions (threshold=%.2f, split_confluent=%s)", args.threshold, args.split_confluent)
-    labeled_img = label_lesions(seg_img, threshold=args.threshold, split_confluent=args.split_confluent)
+    logger.info(
+        "Labeling lesions (threshold=%.2f, split_confluent=%s, split_method=%s)",
+        args.threshold, args.split_confluent, args.split_method,
+    )
+    labeled_result = label_lesions(
+        seg_img,
+        threshold=args.threshold,
+        split_confluent=args.split_confluent,
+        split_method=args.split_method,
+    )
+    labeled_img = labeled_result.label_img
 
     import numpy as np
-    n_lesions = int(labeled_img.get_fdata().max())
+    n_lesions = labeled_result.n_lesions
     logger.info("Found %d lesion(s)", n_lesions)
     if n_lesions == 0:
         logger.warning("No lesions found. Check threshold or input file.")
@@ -171,7 +186,7 @@ def main():
     # --- Quantify -----------------------------------------------------------
     logger.info("Quantifying lesions (n_shells=%d, radiomics=%s) ...", args.n_shells, not args.no_radiomics)
     df = quantify_lesions(
-        labeled_img=labeled_img,
+        labeled_img=labeled_result,
         modalities=modalities,
         prob_map=prob_map,
         nawm_mask=nawm_mask,

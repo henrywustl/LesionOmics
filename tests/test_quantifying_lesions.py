@@ -411,3 +411,29 @@ class TestQuantifyLesions:
         df = quantify_lesions(ds["labeled_img"], ds["modalities"], include_radiomics=False)
         for mod in ("T1", "T2"):
             assert f"{mod}_boundary_grad_mean" in df.columns
+
+    def test_hierarchy_columns_present_when_labeled_result(self):
+        """When a LabeledResult is passed, confluent_lesion_id and display_id appear in output."""
+        pass  # covered by test_hierarchy_columns_present_from_label_lesions
+
+    def test_hierarchy_columns_present_from_label_lesions(self):
+        """quantify_lesions adds confluent_lesion_id/sub_label/display_id when given a LabeledResult."""
+        shape = (40, 20, 20)
+        affine = np.eye(4)
+        header = nib.Nifti1Header()
+        header.set_data_shape(shape)
+        header.set_zooms((1.0, 1.0, 1.0))
+
+        data = np.zeros(shape, dtype=np.float32)
+        data[2:8, 5:12, 5:12] = 1.0
+        data[20:26, 5:12, 5:12] = 1.0
+        seg_img = nib.Nifti1Image(data, affine, header)
+
+        t1 = nib.Nifti1Image(np.ones(shape, dtype=np.float32) * 800, affine, header)
+        from src.label_lesions import label_lesions
+        from src.quantifying_lesions import quantify_lesions
+        result = label_lesions(seg_img, threshold=0.5)
+        df = quantify_lesions(result, {"T1": t1}, include_radiomics=False)
+        for col in ("confluent_lesion_id", "sub_label", "display_id"):
+            assert col in df.columns, f"Missing column: {col}"
+        assert set(df["display_id"]) == {"L1", "L2"}

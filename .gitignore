@@ -205,3 +205,9 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# LesionOmics generated output files
+lesion_measurements.csv
+longitudinal_matches*.csv
+features_tp*.csv
+splitting_comparison/

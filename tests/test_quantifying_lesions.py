@@ -2,7 +2,7 @@ import numpy as np
 import nibabel as nib
 import pytest
 
-from src.quantifying_lesions import (
+from lesionomics.quantifying_lesions import (
     voxel_volume_from_header,
     _convex_hull_volume,
     _surface_area_mm2,
@@ -97,7 +97,7 @@ class TestSurfaceCurvatureStats:
         assert set(result.keys()) == {"curvature_mean", "curvature_std", "curvature_abs_max"}
 
     def test_graceful_without_trimesh(self, monkeypatch):
-        import src.quantifying_lesions as qm
+        import lesionomics.quantifying_lesions as qm
         monkeypatch.setattr(qm, "_TRIMESH_AVAILABLE", False)
         shape = (20, 20, 20)
         z, y, x = np.mgrid[0:20, 0:20, 0:20]
@@ -430,8 +430,8 @@ class TestQuantifyLesions:
         seg_img = nib.Nifti1Image(data, affine, header)
 
         t1 = nib.Nifti1Image(np.ones(shape, dtype=np.float32) * 800, affine, header)
-        from src.label_lesions import label_lesions
-        from src.quantifying_lesions import quantify_lesions
+        from lesionomics.label_lesions import label_lesions
+        from lesionomics.quantifying_lesions import quantify_lesions
         result = label_lesions(seg_img, threshold=0.5)
         df = quantify_lesions(result, {"T1": t1}, include_radiomics=False)
         for col in ("confluent_lesion_id", "sub_label", "display_id"):

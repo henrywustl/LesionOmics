@@ -16,8 +16,8 @@ common grid).
 
 Typical usage
 -------------
->>> from src.label_lesions import label_lesions
->>> from src.tracking import match_lesions_longitudinal
+>>> from lesionomics.label_lesions import label_lesions
+>>> from lesionomics.tracking import match_lesions_longitudinal
 >>>
 >>> r_tp1 = label_lesions(seg_tp1)
 >>> r_tp2 = label_lesions(seg_tp2_registered_to_tp1_space)

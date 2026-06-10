@@ -320,7 +320,11 @@ def quantify_lesions(
     """Quantify features for every labeled lesion.
 
     Args:
-        labeled_img: NIfTI with integer lesion labels (0 = background).
+        labeled_img: Either a NIfTI with integer lesion labels (0 = background)
+                     or a :class:`~lesionomics.label_lesions.LabeledResult`.
+                     When a ``LabeledResult`` is passed, its ``hierarchy`` is
+                     merged into the output, adding the ``confluent_lesion_id``,
+                     ``sub_label`` and ``display_id`` columns.
         modalities: Dict mapping modality name to NIfTI image, e.g.
                     ``{"T1": t1_img, "T2": t2_img}``.  Any number of
                     modalities accepted.
@@ -333,7 +337,8 @@ def quantify_lesions(
         n_shells: Number of concentric erosion shells for radial profiles.
 
     Returns:
-        DataFrame with one row per lesion and one column per feature.
+        DataFrame with one row per lesion and one column per feature. When a
+        ``LabeledResult`` was supplied the hierarchy columns are appended.
     """
     # Accept either a bare NIfTI or a LabeledResult
     hierarchy: "pd.DataFrame | None" = None
@@ -381,9 +386,6 @@ def quantify_lesions(
         n_vox = int(np.count_nonzero(mask))
         vol_mm3 = n_vox * voxel_vol
         r["volume_mm3"] = vol_mm3
-
-        # ---- Bounding box (computed for spatial tracking; not emitted to CSV) -
-        # bbox_{z,y,x}_{min,max} are retained here for longitudinal pipelines.
 
         # ---- Centre of mass -----------------------------------------------
         com_vox = tuple(float(c) for c in ndimage.center_of_mass(mask))
@@ -452,7 +454,7 @@ def quantify_lesions(
             for i, ev in enumerate(eigvals_4d):
                 r[f"{mod_name}_4d_eigval_{i}"] = float(ev)
 
-            # 19 intensity stats
+            # 11 intensity stats
             r.update(_intensity_stats(mod_vals, mod_name))
 
             # Boundary gradient

@@ -3,8 +3,8 @@ import nibabel as nib
 import pytest
 import pandas as pd
 
-from src.label_lesions import label_lesions, LabeledResult
-from src.tracking import match_lesions_longitudinal
+from lesionomics.label_lesions import label_lesions, LabeledResult
+from lesionomics.tracking import match_lesions_longitudinal
 
 
 def _make_img(data, affine=None):

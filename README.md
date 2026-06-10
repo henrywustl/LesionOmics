@@ -6,192 +6,218 @@ Designed for Multiple Sclerosis research but applicable to any 3D segmented regi
 ## Features
 
 **Shape** (computed once per lesion, modality-independent):
-- Volume (mm³), convex hull volume and convexness ratio
-- Surface area (mm²), surface-to-volume ratio, sphericity
-- Inertia tensor eigenvalues; elongation, flatness, isotropy
-- Euler number, inter-lesion nearest-neighbour distance
-- Hemisphere (L/R), centre of mass in mm space
+- Volume (mm³), convex hull volume and solidity ratio
+- Surface area (mm²), sphericity, surface curvature statistics
+- Inertia-derived elongation, flatness, isotropy
+- Euler number (topology), centre of mass in mm space
+- Inter-lesion nearest-neighbour distance and neighbour counts within 10/20/30 mm
 
 **Intensity** (per modality — any 3D channel accepted):
-- Mean, median, mode, min, max, std, skewness, kurtosis, IQR, entropy
-- Boundary gradient mean and std (rim-enhancing vs. diffuse pattern)
+- Mean, median, mode, min, max, std, skewness, kurtosis, IQR, entropy, energy
+- Boundary gradient mean/std (rim-enhancing vs. diffuse pattern)
+- Perilesional ring and concentric-shell radial profiles
 - NAWM-normalised mean (when a NAWM mask is supplied)
 - 4D inertia eigenvalues combining spatial coordinates with per-modality intensity
-- Concentric shell profiles (radial intensity gradient)
 
 **Pairwise** (all modality pairs, automatic):
-- Mean intensity ratio (e.g. T1/T2, T1/FLAIR)
-- Within-lesion cross-modality Pearson correlation
+- Mean intensity ratio, Pearson correlation, mutual information
 
 **Texture** (via [PyRadiomics](https://pyradiomics.readthedocs.io/), per modality):
 - GLCM, GLRLM, GLSZM, NGTDM feature sets
 
 **Probabilistic** (when a probability map is supplied):
-- Fuzzy volume, mean/std confidence, probability entropy
-- Core volume (prob > 0.9), rim volume (0.3 < prob < 0.7)
+- Fuzzy volume, mean/std confidence, probability-weighted centroid, entropy
+- Core volume (prob > 0.8), rim volume (0.3 < prob ≤ 0.8)
+
+---
 
 ## Installation
 
 ```bash
-pip install -e .
+pip install -e .                  # runtime only
+pip install -e ".[dev]"           # + pytest
+pip install -e ".[radiomics]"     # + PyRadiomics texture features
+pip install -e ".[ants]"          # + antspyx (Jacobian pipeline)
 ```
+
+Installing the package adds a single command-line entry point, **`lesionomics`**,
+with one sub-command per tool.
 
 > `antspyx` may need to be installed separately — see the
 > [ANTsPy installation guide](https://github.com/ANTsX/ANTsPy#installation).
 
 ---
 
-## Quick Start
+## Command-Line Tools
+
+Everything is reachable through `lesionomics <command>`. Run
+`lesionomics <command> --help` for the full option list of any command.
+
+```
+lesionomics quantify           Quantify lesions from a segmentation → CSV
+lesionomics track              Match lesions across two timepoints → CSV
+lesionomics compare-splitting  Benchmark the three splitting algorithms → CSVs + plots
+lesionomics jacobian           Jacobian-determinant volume-change map (needs antspyx)
+```
+
+### 1. `quantify` — features for every lesion
+
+Label lesions in a segmentation and write a per-lesion feature table.
+
+```bash
+# Minimal: one segmentation, one modality
+lesionomics quantify \
+    --seg data/truenet.nii.gz \
+    --modalities T1=data/T1.nii.gz \
+    --output lesion_measurements.csv
+
+# Multi-modal, split confluent lesions, skip the slow texture features
+lesionomics quantify \
+    --seg data/truenet.nii.gz \
+    --modalities T1=data/T1.nii.gz T2=data/T2.nii.gz FLAIR=data/FLAIR.nii.gz \
+    --split-confluent --split-method watershed \
+    --no-radiomics \
+    --output lesion_measurements.csv
+
+# With optional maps (NAWM normalisation + probability + Jacobian change)
+lesionomics quantify \
+    --seg data/truenet.nii.gz \
+    --modalities T1=data/T1.nii.gz T2=data/T2.nii.gz \
+    --prob-map data/truenet.nii.gz \
+    --nawm-mask data/nawm.nii.gz \
+    --jacobian-map jacobian_determinant.nii.gz
+```
+
+### 2. `track` — longitudinal lesion matching
+
+Match lesions between two **co-registered** timepoints (register the follow-up
+to baseline first), classifying each as `stable` / `split` / `merge` / `new` /
+`resolved`.
+
+```bash
+lesionomics track \
+    --seg-tp1 data/seg_baseline.nii.gz \
+    --seg-tp2 data/seg_followup_in_baseline_space.nii.gz \
+    --threshold 0.3 \
+    --split-confluent --split-method watershed \
+    --min-iou 0.1 \
+    --output longitudinal_matches.csv
+```
+
+Output columns: `tp1_display_id`, `tp2_display_id`, `tp1_confluent_lesion_id`,
+`tp2_confluent_lesion_id`, `sub_label`s, `overlap_vox`, `iou`, `match_type`.
+
+### 3. `compare-splitting` — benchmark the splitting algorithms
+
+Run all three confluent-splitting methods on the same input and emit comparison
+spreadsheets and diagnostic plots. With no real data present it generates a
+synthetic scene so you can try it immediately:
+
+```bash
+# Try it right now (synthetic data, fast)
+lesionomics compare-splitting --no-quantify --output-dir splitting_comparison/
+
+# On real data
+lesionomics compare-splitting \
+    --seg data/truenet.nii.gz \
+    --modalities T1=data/T1.nii.gz T2=data/T2.nii.gz \
+    --output-dir splitting_comparison/
+```
+
+Produces `comparison_per_lesion.csv`, `comparison_aggregated.csv`,
+`comparison_pairwise_diff.csv`, and five PNG plots.
+
+### 4. `jacobian` — volumetric-change map (requires antspyx)
+
+SyN-register a follow-up scan to baseline and write the Jacobian determinant
+(>1 = local expansion, <1 = contraction). Feed the result back into
+`quantify --jacobian-map`.
+
+```bash
+lesionomics jacobian \
+    --t1-fixed data/T1_baseline.nii.gz \
+    --t1-moving data/T1_followup.nii.gz \
+    --t2-fixed data/T2_baseline.nii.gz \
+    --t2-moving data/T2_followup.nii.gz \
+    --output jacobian_determinant.nii.gz
+```
+
+---
+
+## Python API
 
 ```python
 import nibabel as nib
-from src.label_lesions import label_lesions
-from src.quantifying_lesions import quantify_lesions
+from lesionomics import label_lesions, quantify_lesions, match_lesions_longitudinal
 
 seg_img = nib.load("data/truenet.nii.gz")
 
 # 1 — label connected lesion components
 result = label_lesions(seg_img, threshold=0.3)
-
-print(f"{result.n_lesions} lesion(s) in "
-      f"{result.n_confluent_lesions} contiguous region(s)")
+print(f"{result.n_lesions} lesion(s) in {result.n_confluent_lesions} contiguous region(s)")
 print(result.hierarchy)
 #    label  confluent_lesion_id sub_label display_id
 #        1                    1      None         L1
 #        2                    2      None         L2
-#        3                    3      None         L3
 
 # 2 — quantify shape + intensity features
-modalities = {
-    "T1": nib.load("data/T1.nii.gz"),
-    "T2": nib.load("data/T2.nii.gz"),
-}
+modalities = {"T1": nib.load("data/T1.nii.gz"), "T2": nib.load("data/T2.nii.gz")}
 df = quantify_lesions(result, modalities=modalities, include_radiomics=False)
 df.to_csv("lesion_measurements.csv", index=False)
 ```
 
----
+### Confluent lesion splitting
 
-## Confluent Lesion Splitting
+When lesions merge into a single contiguous region, three algorithms can
+separate them:
 
-When two or more lesions merge into a single contiguous region LesionOmics can
-attempt to separate them. Three algorithms are available:
-
-| `split_method`   | Algorithm |
-|------------------|-----------|
+| `split_method` | Algorithm |
+|----------------|-----------|
 | `"erosion"` *(default)* | Iterative morphological erosion → Voronoi (EDT nearest-seed) expansion |
-| `"watershed"` | Distance-transform watershed; seeds at EDT local maxima. Respects narrow necks between regions. |
-| `"random_walker"` | Erosion-derived seeds + random-walk diffusion boundary placement. Smooth, probabilistic splits. |
+| `"watershed"` | Distance-transform watershed; seeds at EDT local maxima. Respects narrow necks. |
+| `"random_walker"` | Erosion-derived seeds + random-walk diffusion. Smooth, probabilistic splits. |
 
 ```python
-result = label_lesions(
-    seg_img,
-    threshold=0.3,
-    split_confluent=True,
-    split_method="watershed",   # "erosion" | "watershed" | "random_walker"
-)
-
-# hierarchy after splitting:
+result = label_lesions(seg_img, threshold=0.3,
+                       split_confluent=True, split_method="watershed")
 #    label  confluent_lesion_id sub_label display_id
 #        1                    1         A        L1A  ← sub-lesion A of contiguous region 1
 #        2                    1         B        L1B  ← sub-lesion B of contiguous region 1
 #        3                    2      None         L2  ← isolated lesion (unsplit)
 ```
 
-Sub-lesion naming: isolated contiguous regions become `L1`, `L2`, …; when a
-region is split the sub-lesions are labelled `L2A`, `L2B`, `L2C`, … (Excel-style,
-so after `Z` comes `AA`, `AB`, …).
+Isolated regions are named `L1`, `L2`, …; split sub-lesions become `L2A`,
+`L2B`, … (Excel-style, so after `Z` comes `AA`). The `confluent_lesion_img`
+NIfTI always holds the pre-split contiguous component labels.
 
-The `confluent_lesion_img` NIfTI always stores the *pre-split* contiguous
-component labels, useful for spatial grouping and visualisation.
-
----
-
-## Longitudinal Lesion Tracking
-
-Both segmentations must be in the same voxel space (register the follow-up to
-baseline before calling `label_lesions`).
+### Longitudinal tracking
 
 ```python
-from src.tracking import match_lesions_longitudinal
-
-result_tp1 = label_lesions(seg_tp1, threshold=0.3, split_confluent=True)
-result_tp2 = label_lesions(seg_tp2, threshold=0.3, split_confluent=True)
-
-matches = match_lesions_longitudinal(result_tp1, result_tp2, min_iou=0.1)
-matches.to_csv("longitudinal_matches.csv", index=False)
+r1 = label_lesions(seg_tp1, threshold=0.3, split_confluent=True)
+r2 = label_lesions(seg_tp2, threshold=0.3, split_confluent=True)  # same voxel space
+matches = match_lesions_longitudinal(r1, r2, min_iou=0.1)
 ```
-
-Output columns:
-
-| Column | Description |
-|--------|-------------|
-| `tp1_label` / `tp2_label` | Integer label in each timepoint's `label_img` |
-| `tp1_confluent_lesion_id` / `tp2_confluent_lesion_id` | Pre-split contiguous region ID |
-| `tp1_sub_label` / `tp2_sub_label` | `None` for isolated lesions, `"A"/"B"/…` for split sub-lesions |
-| `tp1_display_id` / `tp2_display_id` | Human-readable ID (e.g. `"L2B"`) |
-| `overlap_vox` | Shared voxel count |
-| `iou` | Intersection-over-Union |
-| `match_type` | `stable` / `split` / `merge` / `new` / `resolved` |
 
 Classification is contiguous-lesion-aware: split sub-lesions from the same
-contiguous region are treated as a unit when detecting split/merge events.
-
----
-
-## Jacobian Determinant (Longitudinal Volume Change)
-
-```python
-import ants
-from src.jacobian_determinant import compute_lesion_jacobian_pipeline
-
-jacobian = compute_lesion_jacobian_pipeline(
-    t1_fixed=ants.image_read("T1_tp1.nii.gz"),
-    t1_moving=ants.image_read("T1_tp2.nii.gz"),
-)
-jacobian.to_file("jacobian_determinant.nii.gz")
-```
-
-Pass the Jacobian map to `quantify_lesions()` via `jacobian_map=` to get
-per-lesion volumetric change features.
+region are treated as a unit when detecting split/merge events.
 
 ---
 
 ## Example Scripts
 
-Runnable examples are in the `examples/` directory. All fall back to synthetic
-data when no real files are present, so they always run end-to-end.
+Runnable end-to-end examples live in `examples/`. All fall back to synthetic
+data when no real files are present, so they always run:
 
 | Script | Demonstrates |
 |--------|--------------|
-| `examples/01_basic_quantification.py` | Minimal label → quantify → CSV workflow |
-| `examples/02_confluent_lesion_splitting.py` | All three splitting algorithms; hierarchy inspection |
-| `examples/03_longitudinal_tracking.py` | Matching across two timepoints; stable/new/resolved/split/merge |
-| `examples/04_full_pipeline.py` | Combined: split + quantify + track + volume change |
+| `examples/01_basic_quantification.py` | label → quantify → CSV |
+| `examples/02_confluent_lesion_splitting.py` | All three splitting algorithms; hierarchy |
+| `examples/03_longitudinal_tracking.py` | stable/new/resolved/split/merge matching |
+| `examples/04_full_pipeline.py` | split + quantify + track + volume change |
 
 ```bash
 python examples/01_basic_quantification.py
-python examples/02_confluent_lesion_splitting.py
-python examples/03_longitudinal_tracking.py
-python examples/04_full_pipeline.py
 ```
-
----
-
-## Command-Line Interface
-
-```bash
-python run.py \
-    --seg data/truenet.nii.gz \
-    --modalities T1=data/T1.nii.gz T2=data/T2.nii.gz \
-    --threshold 0.3 \
-    --split-confluent \
-    --split-method watershed \
-    --n-shells 5 \
-    --output results.csv
-```
-
-All options: `python run.py --help`
 
 ---
 
@@ -201,21 +227,30 @@ All options: `python run.py --help`
 Input: segmentation / probability map + co-registered modality images
            │
            ▼
-    label_lesions()
+    label_lesions()          → LabeledResult (label_img, confluent_lesion_img, hierarchy)
       threshold → contiguous connected components
       optional confluent splitting (erosion / watershed / random_walker)
-      → LabeledResult  (label_img, confluent_lesion_img, hierarchy)
            │
            ▼
-    quantify_lesions()
+    quantify_lesions()       → DataFrame (one row per lesion, includes display_id)
       shape + intensity + texture + probabilistic features
-      → DataFrame (one row per lesion, columns include display_id)
            │
            ▼
-    match_lesions_longitudinal()     ← two timepoints, same voxel space
-      IoU-based matching, contiguous-lesion-aware split/merge detection
-      → DataFrame  (match_type: stable/split/merge/new/resolved)
-           │
-           ▼
-    lesion_measurements.csv  +  longitudinal_matches.csv
+    match_lesions_longitudinal()   → DataFrame (match_type: stable/split/merge/new/resolved)
+      IoU matching across two timepoints, contiguous-lesion-aware
 ```
+
+---
+
+## Development
+
+```bash
+pip install -e ".[dev]"
+pytest tests/ -q
+```
+
+CI runs the test suite on Python 3.10–3.12 for every push and pull request.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

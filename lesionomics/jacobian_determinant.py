@@ -23,7 +23,7 @@ def _require_ants():
     if not _ANTS_AVAILABLE:
         raise ImportError(
             "antspyx is required for the Jacobian pipeline. "
-            "Install it with: pip install antspyx"
+            "Install it with: pip install lesionomics[ants]"
         )
 
 

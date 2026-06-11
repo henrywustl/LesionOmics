@@ -168,7 +168,7 @@ def _perilesional_ring_stats(
     ring_std = float(np.std(ring_vals)) if ring_vals.size > 0 else np.nan
     lesion_mean = float(np.mean(lesion_vals)) if lesion_vals.size > 0 else np.nan
 
-    if ring_mean and not np.isnan(ring_mean) and ring_mean != 0:
+    if not np.isnan(ring_mean) and ring_mean != 0:
         ratio = lesion_mean / ring_mean
     else:
         ratio = np.nan
@@ -205,7 +205,8 @@ def _concentric_shell_stats(
         shells.append(current & ~eroded)
         current = eroded
     else:
-        # All n_shells completed; remaining core is NOT added as an extra shell
+        # Loop completed all n_shells without breaking; innermost core (still in
+        # `current`) is intentionally excluded to keep shell count fixed at n_shells.
         pass
 
     result = {}
@@ -397,7 +398,9 @@ def quantify_lesions(
         coords_mm_arr = nib.affines.apply_affine(affine, coords_vox)
         hull_vol = _convex_hull_volume(coords_mm_arr)
         r["convex_hull_volume_mm3"] = hull_vol
-        r["solidity"] = (vol_mm3 / hull_vol) if hull_vol > 0 else np.nan
+        # Clamp to [0, 1]: voxelized volume can numerically exceed the point-cloud
+        # convex hull for small lesions due to voxel-centre vs. voxel-extent mismatch.
+        r["solidity"] = float(min(vol_mm3 / hull_vol, 1.0)) if hull_vol > 0 else np.nan
 
         # ---- Surface area + sphericity ------------------------------------
         sa_mm2 = _surface_area_mm2(mask, voxel_sizes)

@@ -384,6 +384,21 @@ class TestQuantifyLesions:
         assert "T1_mean" in df.columns
         assert "T1_over_T2_mean_ratio" not in df.columns
 
+    def test_shape_metric_ranges(self, synthetic_dataset):
+        """Shape metrics have known mathematical bounds that should always hold."""
+        ds = synthetic_dataset
+        df = quantify_lesions(ds["labeled_img"], ds["modalities"], include_radiomics=False)
+        # Sphericity: (0, 1] — sphere achieves 1, all other convex shapes < 1
+        sph = df["sphericity"].dropna()
+        assert (sph > 0).all() and (sph <= 1.0 + 1e-6).all(), f"sphericity out of (0,1]: {sph.values}"
+        # Solidity: (0, 1] — convex hull volume >= lesion volume
+        sol = df["solidity"].dropna()
+        assert (sol > 0).all() and (sol <= 1.0 + 1e-6).all(), f"solidity out of (0,1]: {sol.values}"
+        # Elongation, flatness, isotropy: sqrt of eigenvalue ratios ≤ 1 when eigenvalues sorted descending
+        for col in ("elongation", "flatness", "isotropy"):
+            vals = df[col].dropna()
+            assert (vals >= 0).all() and (vals <= 1.0 + 1e-6).all(), f"{col} out of [0,1]: {vals.values}"
+
     def test_no_nan_in_core_columns(self, synthetic_dataset):
         ds = synthetic_dataset
         df = quantify_lesions(ds["labeled_img"], ds["modalities"], include_radiomics=False)

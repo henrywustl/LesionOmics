@@ -107,6 +107,9 @@ lesionomics track \
 Output columns: `tp1_display_id`, `tp2_display_id`, `tp1_confluent_lesion_id`,
 `tp2_confluent_lesion_id`, `sub_label`s, `overlap_vox`, `iou`, `match_type`.
 
+`match_type` values: `stable` (1-to-1), `split` (1 TP1 → ≥2 TP2), `merge` (≥2 TP1 → 1 TP2),
+`complex` (≥2 TP1 → ≥2 TP2), `new` (TP2 only), `resolved` (TP1 only).
+
 ### 3. `compare-splitting` — benchmark the splitting algorithms
 
 Run all three confluent-splitting methods on the same input and emit comparison

@@ -3,8 +3,8 @@ import nibabel as nib
 import pytest
 import pandas as pd
 
-from src.label_lesions import label_lesions, LabeledResult
-from src.tracking import match_lesions_longitudinal
+from lesionomics.label_lesions import label_lesions, LabeledResult
+from lesionomics.tracking import match_lesions_longitudinal
 
 
 def _make_img(data, affine=None):
@@ -87,6 +87,18 @@ class TestMatchLesionsLongitudinal:
         r2 = label_lesions(_make_img(np.zeros(shape, dtype=np.float32)), threshold=0.5)
         df = match_lesions_longitudinal(r1, r2)
         assert all(df["match_type"] == "resolved")
+
+    def test_valid_match_types(self):
+        """match_type must always be one of the six documented values."""
+        img = _lesion_img((30, 20, 20), [
+            np.s_[2:8, 5:12, 5:12],
+            np.s_[15:20, 5:12, 5:12],
+        ])
+        r1 = label_lesions(img, threshold=0.5)
+        r2 = label_lesions(img, threshold=0.5)
+        df = match_lesions_longitudinal(r1, r2)
+        valid = {"stable", "split", "merge", "complex", "new", "resolved"}
+        assert set(df["match_type"]).issubset(valid)
 
     def test_match_columns_present(self):
         img = _lesion_img((30, 20, 20), [np.s_[2:8, 5:12, 5:12]])

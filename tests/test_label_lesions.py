@@ -2,7 +2,7 @@ import numpy as np
 import nibabel as nib
 import pytest
 
-from src.label_lesions import (
+from lesionomics.label_lesions import (
     relabel_from_largest_to_smallest,
     erosion_derived_confluent_lesion_splitting,
     watershed_confluent_lesion_splitting,
@@ -301,7 +301,7 @@ class TestLabeledResultHierarchy:
         np.testing.assert_array_equal(result.confluent_lesion_img.affine, affine)
 
     def test_int_to_sublabel(self):
-        from src.label_lesions import _int_to_sublabel
+        from lesionomics.label_lesions import _int_to_sublabel
         assert _int_to_sublabel(1) == "A"
         assert _int_to_sublabel(26) == "Z"
         assert _int_to_sublabel(27) == "AA"

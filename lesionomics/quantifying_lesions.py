@@ -168,7 +168,7 @@ def _perilesional_ring_stats(
     ring_std = float(np.std(ring_vals)) if ring_vals.size > 0 else np.nan
     lesion_mean = float(np.mean(lesion_vals)) if lesion_vals.size > 0 else np.nan
 
-    if ring_mean and not np.isnan(ring_mean) and ring_mean != 0:
+    if not np.isnan(ring_mean) and ring_mean != 0:
         ratio = lesion_mean / ring_mean
     else:
         ratio = np.nan
@@ -205,7 +205,8 @@ def _concentric_shell_stats(
         shells.append(current & ~eroded)
         current = eroded
     else:
-        # All n_shells completed; remaining core is NOT added as an extra shell
+        # Loop completed all n_shells without breaking; innermost core (still in
+        # `current`) is intentionally excluded to keep shell count fixed at n_shells.
         pass
 
     result = {}
@@ -320,7 +321,11 @@ def quantify_lesions(
     """Quantify features for every labeled lesion.
 
     Args:
-        labeled_img: NIfTI with integer lesion labels (0 = background).
+        labeled_img: Either a NIfTI with integer lesion labels (0 = background)
+                     or a :class:`~lesionomics.label_lesions.LabeledResult`.
+                     When a ``LabeledResult`` is passed, its ``hierarchy`` is
+                     merged into the output, adding the ``confluent_lesion_id``,
+                     ``sub_label`` and ``display_id`` columns.
         modalities: Dict mapping modality name to NIfTI image, e.g.
                     ``{"T1": t1_img, "T2": t2_img}``.  Any number of
                     modalities accepted.
@@ -333,7 +338,8 @@ def quantify_lesions(
         n_shells: Number of concentric erosion shells for radial profiles.
 
     Returns:
-        DataFrame with one row per lesion and one column per feature.
+        DataFrame with one row per lesion and one column per feature. When a
+        ``LabeledResult`` was supplied the hierarchy columns are appended.
     """
     # Accept either a bare NIfTI or a LabeledResult
     hierarchy: "pd.DataFrame | None" = None
@@ -382,9 +388,6 @@ def quantify_lesions(
         vol_mm3 = n_vox * voxel_vol
         r["volume_mm3"] = vol_mm3
 
-        # ---- Bounding box (computed for spatial tracking; not emitted to CSV) -
-        # bbox_{z,y,x}_{min,max} are retained here for longitudinal pipelines.
-
         # ---- Centre of mass -----------------------------------------------
         com_vox = tuple(float(c) for c in ndimage.center_of_mass(mask))
         com_mm = tuple(float(c) for c in nib.affines.apply_affine(affine, com_vox))
@@ -395,7 +398,9 @@ def quantify_lesions(
         coords_mm_arr = nib.affines.apply_affine(affine, coords_vox)
         hull_vol = _convex_hull_volume(coords_mm_arr)
         r["convex_hull_volume_mm3"] = hull_vol
-        r["solidity"] = (vol_mm3 / hull_vol) if hull_vol > 0 else np.nan
+        # Clamp to [0, 1]: voxelized volume can numerically exceed the point-cloud
+        # convex hull for small lesions due to voxel-centre vs. voxel-extent mismatch.
+        r["solidity"] = float(min(vol_mm3 / hull_vol, 1.0)) if hull_vol > 0 else np.nan
 
         # ---- Surface area + sphericity ------------------------------------
         sa_mm2 = _surface_area_mm2(mask, voxel_sizes)
@@ -452,7 +457,7 @@ def quantify_lesions(
             for i, ev in enumerate(eigvals_4d):
                 r[f"{mod_name}_4d_eigval_{i}"] = float(ev)
 
-            # 19 intensity stats
+            # 11 intensity stats
             r.update(_intensity_stats(mod_vals, mod_name))
 
             # Boundary gradient

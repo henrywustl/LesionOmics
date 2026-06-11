@@ -6,6 +6,7 @@ different timepoints using voxel-level IoU, then classifies each match:
   stable    — 1-to-1 spatial correspondence above min_iou
   split     — one TP1 blob maps to ≥2 TP2 blobs (blob grew apart)
   merge     — ≥2 TP1 blobs map to one TP2 blob (lesions coalesced)
+  complex   — ≥2 TP1 blobs map to ≥2 TP2 blobs (simultaneous split and merge)
   new       — present at TP2 only (new lesion)
   resolved  — present at TP1 only (lesion resolved)
 
@@ -16,8 +17,8 @@ common grid).
 
 Typical usage
 -------------
->>> from src.label_lesions import label_lesions
->>> from src.tracking import match_lesions_longitudinal
+>>> from lesionomics.label_lesions import label_lesions
+>>> from lesionomics.tracking import match_lesions_longitudinal
 >>>
 >>> r_tp1 = label_lesions(seg_tp1)
 >>> r_tp2 = label_lesions(seg_tp2_registered_to_tp1_space)
@@ -137,7 +138,9 @@ def match_lesions_longitudinal(
             matched_tp2.add(l2)
             n2 = len(cl1_to_cls2.get(b1, set()))
             n1 = len(cl2_to_cls1.get(b2, set()))
-            if n2 > 1 and n1 == 1:
+            if n1 > 1 and n2 > 1:
+                match_type = "complex"
+            elif n2 > 1:
                 match_type = "split"
             elif n1 > 1:
                 match_type = "merge"

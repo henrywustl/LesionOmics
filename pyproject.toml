@@ -6,6 +6,9 @@ build-backend = "setuptools.build_meta"
 name = "lesionomics"
 version = "0.1.0"
 description = "Modality-agnostic lesion quantification from NIfTI neuroimages"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Bradley Judge", email = "bradley.a.judge@gmail.com" }]
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.24",
@@ -22,6 +25,13 @@ dependencies = [
 radiomics = ["pyradiomics>=3.1"]
 ants = ["antspyx>=0.4.2"]
 dev = ["pytest>=7.0"]
+
+[project.scripts]
+lesionomics = "lesionomics.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lesionomics*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

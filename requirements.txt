@@ -1,3 +1,14 @@
+# Runtime + dev dependencies are declared in pyproject.toml (the single source
+# of truth). Install the package itself with:
+#
+#     pip install -e .            # runtime only
+#     pip install -e ".[dev]"     # + pytest
+#     pip install -e ".[radiomics]"  # + PyRadiomics texture features
+#     pip install -e ".[ants]"    # + antspyx (Jacobian pipeline)
+#
+# The pins below are listed only for environments that install requirements
+# directly (e.g. some CI caches) and must mirror pyproject.toml.
+
 numpy>=1.24
 nibabel>=5.0
 scikit-image>=0.21
@@ -6,16 +17,9 @@ pandas>=2.0
 SimpleITK>=2.3
 trimesh>=3.21
 matplotlib>=3.7
-pytest>=7.0
 
-# Transitive dependencies required by torch / deepbet when present in the environment
+# Transitive deps required by torch / deepbet when present in the environment
 tqdm
 filelock
 fsspec>=0.8.5
 jinja2
-
-# Optional — install for texture features:
-# pyradiomics>=3.1
-
-# Optional — install for Jacobian pipeline:
-# antspyx>=0.4.2

@@ -22,8 +22,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.label_lesions import label_lesions
-from src.quantifying_lesions import quantify_lesions
+from lesionomics.label_lesions import label_lesions
+from lesionomics.quantifying_lesions import quantify_lesions
 
 
 # ---------------------------------------------------------------------------

@@ -53,29 +53,42 @@ fi
 # 2. The Python the venv is built from.
 #
 # A venv's bin/python is only a symlink to the interpreter it was created
-# from. With a module Python (python/3.11.14, anaconda3) that target lives
-# under /opt/thpc and is not the same on every node / inside every job
-# container, so the venv breaks ("bin/python3.11: No such file or directory",
-# shown red by ls). Instead, install a self-contained Python on scratch with
-# uv: scratch is mounted everywhere, so the symlink always resolves.
+# from. Built on the module Python (python/3.11.14, itself a spack venv), that
+# link ended up dangling ("bin/python3.11: No such file or directory", shown
+# red by ls). Instead, install a self-contained Python on scratch with uv, so
+# the venv depends on nothing under /opt/thpc.
 # Set PYTHON=/path/to/python3 to use a specific interpreter instead.
 # ---------------------------------------------------------------------------
 PY_VERSION="${PY_VERSION:-3.11}"
 if [ -z "${PYTHON:-}" ]; then
     export UV_INSTALL_DIR="$SCRATCH_BASE/bin"            # the uv binary itself
     export UV_PYTHON_INSTALL_DIR="$SCRATCH_BASE/python"  # the Pythons it installs
-    export UV_PYTHON_BIN_DIR="$SCRATCH_BASE/bin"         # not ~/.local/bin
     export UV_NO_MODIFY_PATH=1                           # leave ~/.bashrc alone
     UV="$UV_INSTALL_DIR/uv"
     if [ ! -x "$UV" ]; then
         echo "installing uv into $UV_INSTALL_DIR"
         curl -LsSf https://astral.sh/uv/install.sh | sh
     fi
-    "$UV" python install "$PY_VERSION"
-    PYTHON=$(UV_PYTHON_PREFERENCE=only-managed "$UV" python find "$PY_VERSION")
+    # --no-bin: no python3.11 shortcut in a bin dir; we call it by full path.
+    "$UV" python install --no-bin "$PY_VERSION"
+    # Make sure everything we just unpacked is readable and executable by
+    # us: on scratch the unpacked files can come out without the execute bit
+    # ("Permission denied (os error 13)").
+    # (u+X alone only re-adds x where some x bit survived, hence the bin/* line.)
+    chmod -R u+rwX "$UV_PYTHON_INSTALL_DIR"
+    chmod u+x "$UV_PYTHON_INSTALL_DIR"/cpython-*/bin/*
+    # Use the real versioned directory (e.g. cpython-3.11.17-linux-x86_64-gnu),
+    # not uv's cpython-3.11-... shortcut link, and don't ask uv to find it:
+    # `uv python find` has to run the interpreter, which is what failed.
+    PYTHON=$(ls -d "$UV_PYTHON_INSTALL_DIR"/cpython-"$PY_VERSION".*-linux-*/bin/python"$PY_VERSION" \
+             2>/dev/null | sort -V | tail -1)
+    [ -n "$PYTHON" ] || { echo "ERROR: no Python $PY_VERSION under $UV_PYTHON_INSTALL_DIR" >&2; exit 1; }
 fi
-if ! "$PYTHON" -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null; then
+if ! "$PYTHON" -c 'import sys; sys.exit(sys.version_info < (3, 10))'; then
     echo "ERROR: $PYTHON is not a working Python >= 3.10 (LST-AI's minimum)." >&2
+    echo "Diagnostics -- please send these:" >&2
+    namei -l "$PYTHON" >&2 2>&1 || ls -l "$PYTHON" >&2
+    findmnt -T "$PYTHON" -o TARGET,FSTYPE,OPTIONS >&2 2>&1 || true
     exit 1
 fi
 echo "base python: $PYTHON ($("$PYTHON" --version 2>&1))"

@@ -4,8 +4,10 @@
 #   bash submit_all_BIDS_LST-AI.bash /path/to/BIDS
 #
 # Optional settings (environment variables):
-#   MODE=cpu|gpu       cpu (default): general partition, no GPU -- usually starts
-#                      far sooner. gpu: general-gpu partition, 1 GPU.
+#   MODE=cpu|gpu       cpu (default): no GPU -- usually starts far sooner.
+#                      gpu: 1 GPU.
+#   PARTITION=name     Slurm partition (default general-cpu for cpu, general-gpu
+#                      for gpu). `sinfo -s` lists the ones that exist.
 #   MAX_JOBS=N         max LST_AI jobs queued/running at once (default 10 cpu, 2 gpu)
 #   SUBJECTS="sub-01 sub-02"   only these subjects (default: all)
 #   LST_EXTRA_ARGS="..."       extra lst flags, e.g. "--segment_only" to skip the
@@ -28,15 +30,17 @@ RUN_SCRIPT="${RUN_SCRIPT:-$(dirname "$(realpath "$0")")/run_single_LST-AI.bash}"
 MODE="${MODE:-cpu}"
 case $MODE in
 	cpu)
-		# Resources come from the #SBATCH lines in the job script
-		SBATCH_RESOURCES=()
+		# Other resources come from the #SBATCH lines in the job script
+		PARTITION="${PARTITION:-general-cpu}"
+		SBATCH_RESOURCES=(--partition="$PARTITION")
 		MAX_JOBS="${MAX_JOBS:-10}"
 		;;
 	gpu)
 		# A short time limit lets the scheduler backfill the job into gaps
 		# between longer jobs, which is often the difference between minutes
 		# and hours in the GPU queue. Any GPU model will do for inference.
-		SBATCH_RESOURCES=(--partition=general-gpu --gpus=1 --time=01:00:00 --mem=16GB --cpus-per-task=4)
+		PARTITION="${PARTITION:-general-gpu}"
+		SBATCH_RESOURCES=(--partition="$PARTITION" --gpus=1 --time=01:00:00 --mem=16GB --cpus-per-task=4)
 		MAX_JOBS="${MAX_JOBS:-2}"
 		;;
 	*)
@@ -44,7 +48,15 @@ case $MODE in
 		exit 1
 		;;
 esac
-echo "mode: $MODE   max concurrent jobs: $MAX_JOBS   job script: $RUN_SCRIPT"
+echo "mode: $MODE   partition: $PARTITION   max concurrent jobs: $MAX_JOBS   job script: $RUN_SCRIPT"
+
+# Check the partition once up front instead of failing every submission
+if ! sinfo -h -p "$PARTITION" -o '%P' 2>/dev/null | grep -q .; then
+	echo "ERROR: Slurm partition '$PARTITION' does not exist here. Available:" >&2
+	sinfo -s >&2
+	echo "Re-run with PARTITION=<a CPU partition from the list above>." >&2
+	exit 1
+fi
 
 # Find T1w files and submit jobs
 find -L "$BIDS_DIR"/sub-* -type f -name "*_T1w.nii*" | sort | while read -r t1file; do

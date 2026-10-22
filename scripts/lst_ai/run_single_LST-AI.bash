@@ -3,7 +3,7 @@
 # sbatch command line for GPU jobs (MODE=gpu); options given there win over
 # these #SBATCH lines.
 #SBATCH --job-name=LST_AI
-#SBATCH --partition=general
+#SBATCH --partition=general-cpu
 #SBATCH --account=compute2-matthew.brier
 #SBATCH --time=04:00:00
 #SBATCH --mem=24GB

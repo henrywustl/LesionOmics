@@ -30,31 +30,8 @@ export TMPDIR="${TMPDIR:-$SCRATCH_BASE/tmp}"
 mkdir -p "$XDG_CACHE_HOME" "$PIP_CACHE_DIR" "$TORCH_HOME" "$TMPDIR" "$(dirname "$LST_ENV")"
 
 # ---------------------------------------------------------------------------
-# 1. A Python >= 3.10 to build the venv from. LST-AI 2.x refuses anything older.
-# ---------------------------------------------------------------------------
-py_ok() { "$1" -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null; }
-
-PYTHON="${PYTHON:-python3}"
-if ! py_ok "$PYTHON"; then
-    echo "$PYTHON is older than 3.10; trying the anaconda module's python"
-    module load anaconda3/2023.09-0 2>/dev/null || true
-    PYTHON=$(command -v python3 || true)
-fi
-if [ -z "$PYTHON" ] || ! py_ok "$PYTHON"; then
-    echo "ERROR: no Python >= 3.10 found. Set PYTHON=/path/to/python3.10+ and re-run." >&2
-    exit 1
-fi
-# A conda env must not be active while the venv is created or used: its
-# packages would leak in through PYTHONPATH / site-packages.
-if [ -n "${CONDA_PREFIX:-}" ] && [ "${CONDA_DEFAULT_ENV:-base}" != "base" ]; then
-    echo "ERROR: conda env '$CONDA_DEFAULT_ENV' is active; run 'conda deactivate' first." >&2
-    exit 1
-fi
-echo "base python: $PYTHON ($("$PYTHON" --version 2>&1))"
-
-# ---------------------------------------------------------------------------
-# 2. Scratch must allow executing files, or every compiled module in the
-#    venv fails to load with "failed to map segment from shared object".
+# 1. Scratch must allow executing files, or the Python installed there and
+#    every compiled module in the venv fail to load.
 # ---------------------------------------------------------------------------
 probe="$TMPDIR/.exec_probe_$$"
 printf '#!/bin/sh\nexit 0\n' > "$probe" && chmod +x "$probe"
@@ -65,10 +42,59 @@ if ! "$probe" 2>/dev/null; then
 fi
 rm -f "$probe"
 
+# A conda env must not be active while the venv is created or used: its
+# packages would leak in through PYTHONPATH / site-packages.
+if [ -n "${CONDA_PREFIX:-}" ] && [ "${CONDA_DEFAULT_ENV:-base}" != "base" ]; then
+    echo "ERROR: conda env '$CONDA_DEFAULT_ENV' is active; run 'conda deactivate' first." >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 2. The Python the venv is built from.
+#
+# A venv's bin/python is only a symlink to the interpreter it was created
+# from. With a module Python (python/3.11.14, anaconda3) that target lives
+# under /opt/thpc and is not the same on every node / inside every job
+# container, so the venv breaks ("bin/python3.11: No such file or directory",
+# shown red by ls). Instead, install a self-contained Python on scratch with
+# uv: scratch is mounted everywhere, so the symlink always resolves.
+# Set PYTHON=/path/to/python3 to use a specific interpreter instead.
+# ---------------------------------------------------------------------------
+PY_VERSION="${PY_VERSION:-3.11}"
+if [ -z "${PYTHON:-}" ]; then
+    export UV_INSTALL_DIR="$SCRATCH_BASE/bin"            # the uv binary itself
+    export UV_PYTHON_INSTALL_DIR="$SCRATCH_BASE/python"  # the Pythons it installs
+    export UV_PYTHON_BIN_DIR="$SCRATCH_BASE/bin"         # not ~/.local/bin
+    export UV_NO_MODIFY_PATH=1                           # leave ~/.bashrc alone
+    UV="$UV_INSTALL_DIR/uv"
+    if [ ! -x "$UV" ]; then
+        echo "installing uv into $UV_INSTALL_DIR"
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+    fi
+    "$UV" python install "$PY_VERSION"
+    PYTHON=$(UV_PYTHON_PREFERENCE=only-managed "$UV" python find "$PY_VERSION")
+fi
+if ! "$PYTHON" -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null; then
+    echo "ERROR: $PYTHON is not a working Python >= 3.10 (LST-AI's minimum)." >&2
+    exit 1
+fi
+echo "base python: $PYTHON ($("$PYTHON" --version 2>&1))"
+
 # ---------------------------------------------------------------------------
 # 3. venv + torch + LST-AI
 # ---------------------------------------------------------------------------
-if [ ! -x "$LST_ENV/bin/python" ]; then
+# Rebuild the venv if its interpreter is gone (dangling symlink) or it was
+# made from a different base Python. --clear empties it first; the pip cache
+# on scratch makes the reinstall mostly a local copy.
+# (A venv's bin/python is a symlink chain ending at the base interpreter.)
+base_real=$(readlink -f "$(command -v "$PYTHON")")
+venv_real=$(readlink -f "$LST_ENV/bin/python" 2>/dev/null || true)
+if [ -d "$LST_ENV" ] && { ! "$LST_ENV/bin/python" -c '' 2>/dev/null \
+        || [ "$venv_real" != "$base_real" ]; }; then
+    echo "existing venv at $LST_ENV is broken or built from another Python"
+    echo "  (its python -> ${venv_real:-nothing}); recreating it from scratch"
+    "$PYTHON" -m venv --clear "$LST_ENV"
+elif [ ! -x "$LST_ENV/bin/python" ]; then
     echo "creating venv: $LST_ENV"
     "$PYTHON" -m venv "$LST_ENV"
 fi

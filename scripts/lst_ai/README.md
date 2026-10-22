@@ -34,4 +34,8 @@ Notes:
   separate HD-BET or `greedy` install are needed any more.
 - Only pre-releases of LST-AI 2.x are on PyPI so far, so plain `pip install lst-ai`
   fails; the setup script installs `lst-ai>=2.0.0rc1`.
+- The venv is built on a self-contained Python 3.11 that the setup script installs
+  on scratch (`$SCRATCH_BASE/python`, via `uv`), not on a module Python: a venv only
+  links to its base interpreter, and module paths under `/opt/thpc` are not the same
+  on every node, which left `bin/python3.11` as a dangling link.
 - Inputs must be `.nii.gz` and not skull-stripped (otherwise pass `--stripped`).

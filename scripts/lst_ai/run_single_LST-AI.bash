@@ -72,7 +72,7 @@ export OMP_NUM_THREADS="$NCPU" MKL_NUM_THREADS="$NCPU"
 # lst defaults to GPU 0 and fails outright without one, so pick explicitly.
 LST_DEVICE="${LST_DEVICE:-auto}"
 if [ "$LST_DEVICE" = auto ]; then
-    if python -c 'import sys, torch; sys.exit(not torch.cuda.is_available())' 2>/dev/null; then
+    if "$LST_ENV/bin/python" -c 'import sys, torch; sys.exit(not torch.cuda.is_available())' 2>/dev/null; then
         LST_DEVICE=0
     else
         LST_DEVICE=cpu

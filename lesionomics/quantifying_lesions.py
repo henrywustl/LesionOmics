@@ -31,6 +31,12 @@ except Exception:
     _RADIOMICS_AVAILABLE = False
 
 
+# Voxels kept around each lesion's bounding box for per-lesion computations.
+# Must exceed the widest neighbourhood operation (the 3-voxel perilesional
+# dilation) plus the 1-voxel reach of np.gradient.
+_CROP_MARGIN = 5
+
+
 # ---------------------------------------------------------------------------
 # Public helper: voxel volume
 # ---------------------------------------------------------------------------
@@ -360,13 +366,45 @@ def quantify_lesions(
     nawm_data = nawm_mask.get_fdata().astype(bool) if nawm_mask is not None else None
     jac_data = jacobian_map.get_fdata() if jacobian_map is not None else None
 
-    all_labels = np.unique(labeled_data)
+    # Every image is indexed voxel-for-voxel with the lesion mask, so they must
+    # share its grid; a mismatch would otherwise crash or silently misread.
+    extra_maps = {"prob_map": prob_data, "nawm_mask": nawm_data, "jacobian_map": jac_data}
+    for name, arr in {**mod_arrays, **extra_maps}.items():
+        if arr is not None and arr.shape[:3] != labeled_data.shape[:3]:
+            raise ValueError(
+                f"{name} has shape {arr.shape[:3]} but the segmentation has "
+                f"{labeled_data.shape[:3]}; resample it onto the segmentation grid first."
+            )
+
+    labeled_int = labeled_data.astype(np.int64)
+    all_labels = np.unique(labeled_int)
     all_labels = all_labels[all_labels != 0].astype(int)
+
+    # Per-lesion work happens on the lesion's bounding box plus _CROP_MARGIN
+    # voxels rather than the whole volume. The neighbourhood operations below
+    # (1-voxel erosion, 3-voxel perilesional dilation, central-difference
+    # gradient) never reach further than that, and the box is clipped at the
+    # image edge exactly where the full-volume versions are, so the features
+    # are unchanged -- only much faster on large images.
+    bboxes = ndimage.find_objects(labeled_int)
+    vol_shape = labeled_int.shape
+
+    def _crop(label_val):
+        bb = bboxes[label_val - 1]
+        lo = np.array([max(s.start - _CROP_MARGIN, 0) for s in bb])
+        hi = np.array([min(s.stop + _CROP_MARGIN, n) for s, n in zip(bb, vol_shape)])
+        return tuple(slice(a, b) for a, b in zip(lo, hi)), lo
+
+    # Whole-brain NAWM mean per modality (lesion-independent, so computed once)
+    nawm_means = None
+    if nawm_data is not None and np.any(nawm_data):
+        nawm_means = {name: float(np.mean(arr[nawm_data])) for name, arr in mod_arrays.items()}
 
     # Precompute mm-space centroids for neighbourhood density
     centroids_mm: dict[int, np.ndarray] = {}
     for lv in all_labels:
-        coords = np.column_stack(np.where(labeled_data == lv))
+        sl, lo = _crop(int(lv))
+        coords = np.argwhere(labeled_int[sl] == lv) + lo
         com_vox = coords.mean(axis=0)
         centroids_mm[int(lv)] = nib.affines.apply_affine(affine, com_vox)
 
@@ -379,8 +417,9 @@ def quantify_lesions(
     results = []
 
     for label_val in all_labels:
-        mask = labeled_data == label_val
-        coords_vox = np.column_stack(np.where(mask))
+        sl, lo = _crop(int(label_val))
+        mask = labeled_int[sl] == label_val          # cropped lesion mask
+        coords_vox = np.argwhere(mask) + lo          # full-volume voxel coords
         r: dict = {"label": int(label_val)}
 
         # ---- Volume -------------------------------------------------------
@@ -389,7 +428,7 @@ def quantify_lesions(
         r["volume_mm3"] = vol_mm3
 
         # ---- Centre of mass -----------------------------------------------
-        com_vox = tuple(float(c) for c in ndimage.center_of_mass(mask))
+        com_vox = tuple(float(c) + o for c, o in zip(ndimage.center_of_mass(mask), lo))
         com_mm = tuple(float(c) for c in nib.affines.apply_affine(affine, com_vox))
         for i, ax in enumerate(["z", "y", "x"]):
             r[f"com_mm_{ax}"] = com_mm[i]
@@ -449,7 +488,8 @@ def quantify_lesions(
             r["mean_dist_to_all_lesions_mm"] = np.nan
 
         # ---- Per-modality features ----------------------------------------
-        for mod_name, data_arr in mod_arrays.items():
+        for mod_name, full_arr in mod_arrays.items():
+            data_arr = full_arr[sl]
             mod_vals = data_arr[mask]
 
             # 4-D inertia
@@ -470,9 +510,8 @@ def quantify_lesions(
             r.update(_concentric_shell_stats(data_arr, mask, mod_name, n_shells=n_shells))
 
             # NAWM normalisation
-            if nawm_data is not None and np.any(nawm_data):
-                nawm_vals = data_arr[nawm_data]
-                nawm_mean = float(np.mean(nawm_vals)) if nawm_vals.size > 0 else np.nan
+            if nawm_means is not None:
+                nawm_mean = nawm_means[mod_name]
                 r[f"{mod_name}_nawm_normalized_mean"] = (
                     float(np.mean(mod_vals) / nawm_mean)
                     if nawm_mean and nawm_mean != 0
@@ -480,14 +519,18 @@ def quantify_lesions(
                 )
 
             # PyRadiomics
+            # PyRadiomics gets the full volume: its normalisation settings can
+            # depend on whole-image statistics.
             if radiomics_extractor is not None:
-                r.update(_radiomics_features(mask, data_arr, header, mod_name, radiomics_extractor))
+                full_mask = np.zeros(vol_shape, dtype=bool)
+                full_mask[sl] = mask
+                r.update(_radiomics_features(full_mask, full_arr, header, mod_name, radiomics_extractor))
 
         # ---- Pairwise modality features -----------------------------------
         for i, n1 in enumerate(mod_names):
             for n2 in mod_names[i + 1:]:
-                v1 = mod_arrays[n1][mask]
-                v2 = mod_arrays[n2][mask]
+                v1 = mod_arrays[n1][sl][mask]
+                v2 = mod_arrays[n2][sl][mask]
                 mean1 = float(np.mean(v1))
                 mean2 = float(np.mean(v2))
                 r[f"{n1}_over_{n2}_mean_ratio"] = mean1 / mean2 if mean2 != 0 else np.nan
@@ -500,7 +543,7 @@ def quantify_lesions(
 
         # ---- Jacobian features --------------------------------------------
         if jac_data is not None:
-            jac_vals = jac_data[mask]
+            jac_vals = jac_data[sl][mask]
             r["jacobian_mean"] = float(np.mean(jac_vals))
             r["jacobian_std"] = float(np.std(jac_vals))
             r["jacobian_median"] = float(np.median(jac_vals))
@@ -509,7 +552,7 @@ def quantify_lesions(
 
         # ---- Probabilistic features ---------------------------------------
         if prob_data is not None:
-            prob_vals = prob_data[mask]
+            prob_vals = prob_data[sl][mask]
             total_prob = float(np.sum(prob_vals))
             r["fuzzy_volume_mm3"] = total_prob * voxel_vol
             r["mean_confidence"] = float(np.mean(prob_vals))

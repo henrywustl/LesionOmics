@@ -384,6 +384,26 @@ class TestQuantifyLesions:
         assert "T1_mean" in df.columns
         assert "T1_over_T2_mean_ratio" not in df.columns
 
+    def test_modality_on_different_grid_raises(self, synthetic_dataset):
+        ds = synthetic_dataset
+        wrong = nib.Nifti1Image(np.zeros((70, 70, 60), np.float32), ds["affine"])
+        with pytest.raises(ValueError, match="segmentation grid"):
+            quantify_lesions(ds["labeled_img"], {"T1": wrong}, include_radiomics=False)
+
+    def test_lesion_touching_volume_edge(self, synthetic_dataset):
+        ds = synthetic_dataset
+        labeled = np.zeros(ds["shape"], dtype=np.int32)
+        labeled[0:3, 0:3, 0:3] = 1  # corner lesion: per-lesion crop clipped at the edge
+        df = quantify_lesions(
+            nib.Nifti1Image(labeled, ds["affine"], ds["header"]),
+            ds["modalities"],
+            include_radiomics=False,
+        )
+        assert len(df) == 1
+        assert df.loc[0, "volume_mm3"] == pytest.approx(27.0)
+        assert df.loc[0, "T1_mean"] == pytest.approx(float(ds["t1_data"][0:3, 0:3, 0:3].mean()))
+        assert np.isfinite(df.loc[0, "T1_perilesional_mean"])
+
     def test_shape_metric_ranges(self, synthetic_dataset):
         """Shape metrics have known mathematical bounds that should always hold."""
         ds = synthetic_dataset
